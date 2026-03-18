@@ -3,7 +3,7 @@ name = "whatsapp-ctx-cli"
 version = "0.1.0"
 description = "Semantic + graph search over your WhatsApp messages"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.0",
@@ -21,9 +21,12 @@ dev = [
 [project.scripts]
 wactx = "wactx.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["wactx*"]
+
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
