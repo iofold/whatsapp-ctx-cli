@@ -24,6 +24,9 @@ wactx = "wactx.cli:main"
 [tool.setuptools.packages.find]
 include = ["wactx*"]
 
+[tool.setuptools.package-data]
+wactx = ["bin/*"]
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"

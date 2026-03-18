@@ -9,3 +9,5 @@ build/
 *.duckdb.wal
 .tmp/
 .env
+wactx/bin/
+!wactx/bin/.gitkeep

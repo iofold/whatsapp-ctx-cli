@@ -50,13 +50,7 @@ def init(ctx):
     )
     click.echo("     wactx config api.key your-api-key")
     click.echo()
-    click.echo("  2. Sync your WhatsApp messages (recommended):")
-    click.echo(
-        "     wactx sync                       # connects via QR code on first run"
-    )
-    click.echo("     OR import a chat export:")
-    click.echo("     wactx import chat-export.txt")
-    click.echo()
+    click.echo("  2. wactx sync                       # scan QR code on first run")
     click.echo("  3. wactx index                      # embed messages")
     click.echo('  4. wactx search "your query"        # search!')
 
@@ -69,17 +63,6 @@ def config_cmd(ctx, key, value):
     """Set a config value. Example: wactx config api.key sk-xxx"""
     set_config_value(key, value, ctx.obj["config_path"])
     click.echo(f"Set {key} = {value}")
-
-
-@cli.command("import")
-@click.argument("path", type=click.Path(exists=True))
-@click.pass_context
-def import_cmd(ctx, path):
-    """Import a WhatsApp export (.txt or .zip)."""
-    from wactx.sync import import_file
-
-    chat_name, count = import_file(ctx.obj["config"], Path(path))
-    click.echo(f"Imported {count} messages from '{chat_name}'")
 
 
 @cli.command()
