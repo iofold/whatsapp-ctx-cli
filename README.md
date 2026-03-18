@@ -2,7 +2,7 @@
 
 Semantic + graph search over your WhatsApp messages. Built for founders with 100+ groups who need to find people, conversations, and connections fast.
 
-**What it does**: Import your WhatsApp chats → embed with any OpenAI-compatible API → build a relationship graph → search across people, topics, and messages in one query.
+**What it does**: Sync your WhatsApp via whatsmeow → embed with any OpenAI-compatible API → build a relationship graph → search across people, topics, and messages in one query.
 
 ## Quickstart
 
@@ -16,15 +16,24 @@ wactx init
 wactx config api.base_url https://api.openai.com/v1
 wactx config api.key sk-your-key-here
 
-# 3. Import a WhatsApp export
-#    (WhatsApp → Chat → Export Chat → Without Media → save .txt or .zip)
-wactx import "WhatsApp Chat with Founders Group.txt"
+# 3. Sync your WhatsApp messages (recommended)
+wactx config sync.binary_path /path/to/whatsapp-sync
+wactx sync                    # shows QR code on first run — scan with your phone
 
 # 4. Build the search index
 wactx index
 
 # 5. Search
 wactx search "who knows about GTM consultants"
+```
+
+### Alternative: Import from export file
+
+If you don't have the whatsapp-sync binary, you can import WhatsApp's built-in export:
+
+```bash
+# WhatsApp → Chat → Export Chat → Without Media → save .txt or .zip
+wactx import "WhatsApp Chat with Founders Group.txt"
 ```
 
 ## Search
@@ -124,7 +133,9 @@ wactx config api.base_url http://your-server:8000/v1
 |---------|-------------|
 | `wactx init` | Create config file and database |
 | `wactx config KEY VALUE` | Set a config value |
-| `wactx import FILE` | Import WhatsApp export (.txt or .zip) |
+| `wactx sync [--full] [--live]` | **Sync from WhatsApp** via whatsmeow (primary method) |
+| `wactx download [--chat JID]` | Download media attachments |
+| `wactx import FILE` | Import WhatsApp export (.txt or .zip) — fallback |
 | `wactx index [--reset]` | Embed messages for semantic search |
 | `wactx enrich [--all]` | Extract entities from messages |
 | `wactx graph` | Build relationship graph |
@@ -148,10 +159,10 @@ wactx search "AI engineers in my network" --json
 ## Architecture
 
 ```
-WhatsApp Export (.txt/.zip)
-    │
-    ▼
-wactx import ──→ messages + contacts tables (DuckDB)
+WhatsApp (phone)                      WhatsApp Export (.txt/.zip)
+    │                                         │
+    ▼                                         ▼
+wactx sync (whatsmeow) ──→ messages + contacts tables (DuckDB) ←── wactx import
     │
     ▼
 wactx index  ──→ embeddings via OpenAI-compatible API + HNSW index

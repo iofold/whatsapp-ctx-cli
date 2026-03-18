@@ -1,104 +1,126 @@
 from __future__ import annotations
 
-import logging
 from pathlib import Path
+from typing import Any, cast
 
 import duckdb
 
 from wactx.config import Config
 
-log = logging.getLogger("wactx.db")
-
 SCHEMA_VERSION = 1
-
-CORE_TABLES_SQL = """
-CREATE TABLE IF NOT EXISTS messages (
-    id VARCHAR PRIMARY KEY,
-    chat_jid VARCHAR,
-    sender_jid VARCHAR,
-    is_from_me BOOLEAN DEFAULT false,
-    is_group BOOLEAN DEFAULT false,
-    timestamp TIMESTAMP,
-    msg_type VARCHAR DEFAULT 'text',
-    text_content VARCHAR,
-    media_type VARCHAR,
-    media_path VARCHAR,
-    media_downloaded BOOLEAN DEFAULT false,
-    push_name VARCHAR,
-    sent_date DATE,
-    sent_hour INTEGER,
-    sent_dow INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS contacts (
-    jid VARCHAR PRIMARY KEY,
-    push_name VARCHAR,
-    full_name VARCHAR,
-    business_name VARCHAR,
-    is_group BOOLEAN DEFAULT false,
-    group_name VARCHAR,
-    phone VARCHAR
-);
-
-CREATE TABLE IF NOT EXISTS classifications (
-    message_id VARCHAR,
-    chat_jid VARCHAR,
-    category VARCHAR,
-    confidence DOUBLE,
-    summary VARCHAR,
-    PRIMARY KEY (message_id, chat_jid)
-);
-
-CREATE TABLE IF NOT EXISTS extracted_entities (
-    message_id VARCHAR NOT NULL,
-    chat_jid VARCHAR NOT NULL,
-    entity_type VARCHAR NOT NULL,
-    entity_value VARCHAR NOT NULL,
-    PRIMARY KEY (message_id, entity_type, entity_value)
-);
-
-CREATE TABLE IF NOT EXISTS _meta (
-    key VARCHAR PRIMARY KEY,
-    value VARCHAR
-);
-"""
 
 
 def get_connection(
     config: Config, read_only: bool = False
 ) -> duckdb.DuckDBPyConnection:
-    db_path = config.db_path_resolved
+    db_path = Path(config.db_path)
     if not read_only:
         db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(db_path), read_only=read_only)
+    if not read_only:
+        ensure_schema(conn)
     return conn
 
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    conn.execute(CORE_TABLES_SQL)
-    existing = conn.execute(
-        "SELECT value FROM _meta WHERE key = 'schema_version'"
-    ).fetchone()
-    if not existing:
-        conn.execute(
-            "INSERT INTO _meta (key, value) VALUES ('schema_version', ?)",
-            [str(SCHEMA_VERSION)],
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id VARCHAR NOT NULL,
+            chat_jid VARCHAR NOT NULL,
+            sender_jid VARCHAR NOT NULL,
+            is_from_me BOOLEAN NOT NULL DEFAULT FALSE,
+            is_group BOOLEAN NOT NULL DEFAULT FALSE,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            msg_type VARCHAR NOT NULL DEFAULT 'text',
+            text_content VARCHAR,
+            media_type VARCHAR,
+            push_name VARCHAR,
+            sent_date DATE NOT NULL DEFAULT CURRENT_DATE,
+            sent_hour UTINYINT NOT NULL DEFAULT 0,
+            sent_dow UTINYINT NOT NULL DEFAULT 0,
+            raw_proto BLOB,
+            media_downloaded BOOLEAN DEFAULT FALSE,
+            media_path VARCHAR,
+            embedding FLOAT[768],
+            PRIMARY KEY (id, chat_jid)
         )
-    log.debug("Schema ensured (v%d)", SCHEMA_VERSION)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contacts (
+            jid VARCHAR PRIMARY KEY,
+            push_name VARCHAR,
+            full_name VARCHAR,
+            business_name VARCHAR,
+            is_group BOOLEAN DEFAULT FALSE,
+            group_name VARCHAR
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classifications (
+            message_id VARCHAR NOT NULL,
+            chat_jid VARCHAR NOT NULL,
+            category VARCHAR NOT NULL,
+            confidence VARCHAR,
+            summary VARCHAR,
+            PRIMARY KEY (message_id, chat_jid)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS extracted_entities (
+            id BIGINT,
+            message_id VARCHAR,
+            chat_jid VARCHAR,
+            entity VARCHAR,
+            entity_type VARCHAR,
+            confidence DOUBLE,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            key VARCHAR PRIMARY KEY,
+            value VARCHAR NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO schema_meta (key, value)
+        SELECT 'schema_version', ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM schema_meta WHERE key = 'schema_version'
+        )
+        """,
+        [str(SCHEMA_VERSION)],
+    )
+
+
+def table_exists(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+        [table_name],
+    ).fetchone()
+    return row is not None
 
 
 def get_table_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
-    tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
-    counts = {}
-    for t in tables:
-        if t.startswith("_"):
+    counts: dict[str, int] = {}
+    for table in ("messages", "contacts", "classifications", "extracted_entities"):
+        if not table_exists(conn, table):
             continue
-        counts[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        if row is None:
+            counts[table] = 0
+            continue
+        row_tuple = cast(tuple[Any, ...], row)
+        counts[table] = int(row_tuple[0])
     return counts
-
-
-def table_exists(conn: duckdb.DuckDBPyConnection, name: str) -> bool:
-    row = conn.execute(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?", [name]
-    ).fetchone()
-    return row is not None and row[0] > 0

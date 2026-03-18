@@ -42,14 +42,23 @@ def init(ctx):
     conn.close()
 
     click.echo(f"Config:   {cfg.db_path}")
-    click.echo(f"Database: {cfg.db_path_resolved}")
+    click.echo(f"Database: {cfg.db_path}")
     click.echo()
     click.echo("Next steps:")
-    click.echo("  wactx config api.base_url https://your-openai-compatible-endpoint/v1")
-    click.echo("  wactx config api.key your-api-key")
-    click.echo("  wactx import your-chat-export.txt")
-    click.echo("  wactx index")
-    click.echo('  wactx search "your query"')
+    click.echo(
+        "  1. wactx config api.base_url https://your-openai-compatible-endpoint/v1"
+    )
+    click.echo("     wactx config api.key your-api-key")
+    click.echo()
+    click.echo("  2. Sync your WhatsApp messages (recommended):")
+    click.echo(
+        "     wactx sync                       # connects via QR code on first run"
+    )
+    click.echo("     OR import a chat export:")
+    click.echo("     wactx import chat-export.txt")
+    click.echo()
+    click.echo("  3. wactx index                      # embed messages")
+    click.echo('  4. wactx search "your query"        # search!')
 
 
 @cli.command("config")
@@ -71,6 +80,46 @@ def import_cmd(ctx, path):
 
     chat_name, count = import_file(ctx.obj["config"], Path(path))
     click.echo(f"Imported {count} messages from '{chat_name}'")
+
+
+@cli.command()
+@click.option("--full", is_flag=True, help="Full sync instead of incremental")
+@click.option(
+    "--live", is_flag=True, help="Keep running after sync (receive new messages)"
+)
+@click.pass_context
+def sync(ctx, full, live):
+    """Sync messages from WhatsApp via whatsmeow (primary method).
+
+    First run shows a QR code — scan it with WhatsApp on your phone.
+    Subsequent runs sync incrementally by default.
+
+    Requires the whatsapp-sync binary. Set path with:
+      wactx config sync.binary_path /path/to/whatsapp-sync
+    """
+    from wactx.sync import sync_whatsapp
+
+    sync_whatsapp(ctx.obj["config"], incremental=not full, live=live)
+
+
+@cli.command()
+@click.option("--chat", default=None, help="Filter by chat JID")
+@click.option(
+    "--types", default="image,video,audio,document", help="Media types to download"
+)
+@click.option("--after", default=None, help="Only after this date (YYYY-MM-DD)")
+@click.option("--before", default=None, help="Only before this date (YYYY-MM-DD)")
+@click.pass_context
+def download(ctx, chat, types, after, before):
+    """Download media attachments from synced messages.
+
+    Requires the whatsapp-sync binary and an active WhatsApp session.
+    """
+    from wactx.sync import download_media
+
+    download_media(
+        ctx.obj["config"], chat=chat, types=types, after=after, before=before
+    )
 
 
 @cli.command()
@@ -183,7 +232,7 @@ def stats(ctx):
     from wactx.render import render_stats
 
     cfg = ctx.obj["config"]
-    if not cfg.db_path_resolved.exists():
+    if not cfg.db_path.exists():
         click.echo("No database found. Run 'wactx init' first.")
         return
 

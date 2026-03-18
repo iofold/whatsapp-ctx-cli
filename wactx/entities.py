@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import time
+from collections import defaultdict
+from collections.abc import Iterable
 
 import duckdb
 from openai import AsyncOpenAI
@@ -29,16 +31,29 @@ Entity types:
 
 Rules:
 - Return JSON array ONLY — no markdown, no code fences, no explanation
-- Each element: {"id": "<message_id>", "persons": [...], "orgs": [...], "techs": [...], "urls": [...], "events": [...]}
+- Each element: {"id": "<message_id>", "persons": [...], "orgs": [...], "techs": [...], "urls": [...], "events": [...]} 
 - Empty arrays for categories with no matches
-- Normalize names: "GCP" -> "Google Cloud", "k8s" -> "Kubernetes"
-- Skip generic terms: "the app", "the company", "a startup"
+- Normalize names: "GCP" → "Google Cloud", "k8s" → "Kubernetes", "LLM" → keep as "LLM"
+- Skip generic terms: "the app", "the company", "a startup", "their team"
 - Skip the sender's own name
-- Be conservative — only extract clearly named entities
+- For URLs, extract the full URL if present, or just the domain
+- Be conservative — only extract clearly named entities, not descriptions
 """
 
 
 def ensure_entity_table(conn: duckdb.DuckDBPyConnection) -> None:
+    if table_exists(conn, "extracted_entities"):
+        cols = {
+            row[0] for row in conn.execute("DESCRIBE extracted_entities").fetchall()
+        }
+        required = {"message_id", "chat_jid", "entity_type", "entity_value"}
+        if required.issubset(cols):
+            return
+        log.warning(
+            "Existing extracted_entities schema is incompatible; recreating table with expected columns"
+        )
+        conn.execute("DROP TABLE extracted_entities")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS extracted_entities (
             message_id VARCHAR NOT NULL,
@@ -50,6 +65,48 @@ def ensure_entity_table(conn: duckdb.DuckDBPyConnection) -> None:
     """)
 
 
+def _parse_response(
+    raw: str, id_to_chat: dict[str, str]
+) -> list[tuple[str, str, str, str]]:
+    payload = raw.strip()
+    if not payload:
+        return []
+
+    if payload.startswith("```"):
+        payload = payload.split("\n", 1)[1] if "\n" in payload else payload[3:]
+        if payload.endswith("```"):
+            payload = payload[:-3]
+        payload = payload.strip()
+
+    parsed = json.loads(payload)
+    if not isinstance(parsed, list):
+        return []
+
+    rows: list[tuple[str, str, str, str]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        message_id = str(item.get("id", ""))
+        chat_jid = id_to_chat.get(message_id, "")
+        if not chat_jid:
+            continue
+        for plural_key, singular in [
+            ("persons", "person"),
+            ("orgs", "org"),
+            ("techs", "tech"),
+            ("urls", "url"),
+            ("events", "event"),
+        ]:
+            values = item.get(plural_key, [])
+            if not isinstance(values, Iterable):
+                continue
+            for value in values:
+                if isinstance(value, str) and len(value.strip()) > 1:
+                    rows.append((message_id, chat_jid, singular, value.strip()[:200]))
+
+    return rows
+
+
 async def _extract_batch(
     client: AsyncOpenAI,
     sem: asyncio.Semaphore,
@@ -59,8 +116,8 @@ async def _extract_batch(
     total: int,
 ) -> list[tuple[str, str, str, str]]:
     async with sem:
-        prompt_lines = []
-        id_to_chat = {}
+        prompt_lines: list[str] = []
+        id_to_chat: dict[str, str] = {}
         for m in batch:
             text = m["text"][:500]
             prompt_lines.append(f"[{m['id']}] ({m['group']}) {m['sender']}: {text}")
@@ -76,34 +133,8 @@ async def _extract_batch(
                     ],
                     max_tokens=4096,
                 )
-                raw = (resp.choices[0].message.content or "").strip()
-                if not raw:
-                    return []
-                if raw.startswith("```"):
-                    raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-                    if raw.endswith("```"):
-                        raw = raw[:-3]
-                    raw = raw.strip()
-
-                parsed = json.loads(raw)
-                results = []
-                for item in parsed:
-                    mid = item.get("id", "")
-                    chat_jid = id_to_chat.get(mid, "")
-                    if not chat_jid:
-                        continue
-                    for plural, singular in [
-                        ("persons", "person"),
-                        ("orgs", "org"),
-                        ("techs", "tech"),
-                        ("urls", "url"),
-                        ("events", "event"),
-                    ]:
-                        for val in item.get(plural, []):
-                            if val and isinstance(val, str) and len(val.strip()) > 1:
-                                results.append(
-                                    (mid, chat_jid, singular, val.strip()[:200])
-                                )
+                raw = resp.choices[0].message.content or ""
+                results = _parse_response(raw, id_to_chat)
 
                 if (batch_idx + 1) % 10 == 0 or batch_idx + 1 == total:
                     log.info(
@@ -111,7 +142,13 @@ async def _extract_batch(
                     )
                 return results
 
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                log.warning(
+                    "Batch %d JSON parse failed (attempt %d/3): %s",
+                    batch_idx + 1,
+                    attempt + 1,
+                    e,
+                )
                 if attempt == 2:
                     return []
             except Exception as e:
@@ -179,10 +216,14 @@ async def extract_entities(
 
     log.info("Extracting entities from %d messages...", len(messages))
 
-    batch_size = 40
-    batches = [
-        messages[i : i + batch_size] for i in range(0, len(messages), batch_size)
-    ]
+    by_chat: dict[str, list[dict]] = defaultdict(list)
+    for message in messages:
+        by_chat[message["chat_jid"]].append(message)
+
+    batches: list[list[dict]] = []
+    for chat_messages in by_chat.values():
+        for i in range(0, len(chat_messages), 40):
+            batches.append(chat_messages[i : i + 40])
 
     client = AsyncOpenAI(base_url=config.api.base_url, api_key=config.api.key)
     sem = asyncio.Semaphore(config.api.max_concurrent)
@@ -216,11 +257,25 @@ def get_entity_stats(conn: duckdb.DuckDBPyConnection) -> dict:
             "SELECT COUNT(*), COUNT(DISTINCT entity_value) FROM extracted_entities WHERE entity_type = ?",
             [etype],
         ).fetchone()
-        stats[etype] = {"mentions": row[0], "unique": row[1]}
-    stats["total"] = conn.execute("SELECT COUNT(*) FROM extracted_entities").fetchone()[
-        0
-    ]
-    stats["messages"] = conn.execute(
+        if row is None:
+            mentions = 0
+            unique = 0
+        else:
+            mentions = int(row[0])
+            unique = int(row[1])
+        stats[etype] = {"mentions": mentions, "unique": unique}
+
+    total_row = conn.execute("SELECT COUNT(*) FROM extracted_entities").fetchone()
+    messages_row = conn.execute(
         "SELECT COUNT(DISTINCT message_id) FROM extracted_entities"
-    ).fetchone()[0]
+    ).fetchone()
+    if total_row is None:
+        stats["total"] = 0
+    else:
+        stats["total"] = int(total_row[0])
+
+    if messages_row is None:
+        stats["messages"] = 0
+    else:
+        stats["messages"] = int(messages_row[0])
     return stats
