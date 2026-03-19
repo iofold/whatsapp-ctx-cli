@@ -49,7 +49,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: ${{ matrix.goos == 'windows' && '0' || '1' }}
         run: |
-          cd go
+          cd whatsapp-sync
           BINARY_NAME="whatsapp-sync-${{ matrix.goos }}-${{ matrix.goarch }}"
           if [ "${{ matrix.goos }}" = "windows" ]; then
             BINARY_NAME="${BINARY_NAME}.exe"

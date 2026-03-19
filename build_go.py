@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-GO_SRC = ROOT / "go"
+GO_SRC = ROOT / "whatsapp-sync"
 BIN_DIR = ROOT / "wactx" / "bin"
 
 TARGETS = [
