@@ -16,7 +16,7 @@ class ApiConfig:
     key: str = ""
     embedding_model: str = "text-embedding-3-large"
     embedding_dims: int = 384
-    chat_model: str = "gpt-4.1-nano"
+    chat_model: str = "gpt-5-mini"
     max_concurrent: int = 5
 
 

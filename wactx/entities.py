@@ -131,7 +131,7 @@ async def _extract_batch(
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": "\n".join(prompt_lines)},
                     ],
-                    max_tokens=4096,
+                    max_completion_tokens=4096,
                 )
                 raw = resp.choices[0].message.content or ""
                 results = _parse_response(raw, id_to_chat)

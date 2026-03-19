@@ -50,7 +50,7 @@ def expand_query(client: OpenAI, config: Config, query: str, n: int) -> list[str
                     "content": QUERY_EXPANSION_PROMPT.format(query=query, n=n - 1),
                 }
             ],
-            max_tokens=1024,
+            max_completion_tokens=1024,
         )
         text = (resp.choices[0].message.content or "").strip()
         if text.startswith("```"):
