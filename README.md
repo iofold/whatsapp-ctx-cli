@@ -78,7 +78,7 @@ base_url = "https://api.openai.com/v1"
 key = ""
 embedding_model = "text-embedding-3-large"
 embedding_dims = 384
-chat_model = "gpt-4.1-mini"
+chat_model = "gpt-5-mini"
 max_concurrent = 5
 
 [sync]
