@@ -268,8 +268,6 @@ def build_graph(conn: duckdb.DuckDBPyConnection, config: Config) -> dict:
     del config
     t0 = time.time()
 
-    conn.execute("INSTALL duckpgq FROM community; LOAD duckpgq")
-
     stats: dict[str, int] = {}
     stats.update(build_vertex_tables(conn))
     stats.update(build_edge_tables(conn))

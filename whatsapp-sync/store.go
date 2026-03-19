@@ -87,6 +87,13 @@ func NewDuckStore(path string) (*DuckStore, error) {
 		return nil, fmt.Errorf("ping duckdb %q: %w", path, err)
 	}
 
+	// Load extensions that wactx may have used on this DB (HNSW indexes, property graphs).
+	// Errors ignored — extensions may not be available in all environments.
+	for _, ext := range []string{"vss", "duckpgq"} {
+		db.Exec("INSTALL " + ext)
+		db.Exec("LOAD " + ext)
+	}
+
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialise schema: %w", err)

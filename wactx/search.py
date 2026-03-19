@@ -287,7 +287,6 @@ def run_search(
 
     if use_graph:
         try:
-            conn.execute("LOAD duckpgq")
             results = enrich_with_graph(conn, results, config.search.owner_name)
         except Exception:
             results = enrich_basic(conn, results)

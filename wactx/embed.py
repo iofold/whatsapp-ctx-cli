@@ -36,7 +36,6 @@ def ensure_embedding_column(conn: duckdb.DuckDBPyConnection, dims: int) -> None:
 
 
 def create_hnsw_index(conn: duckdb.DuckDBPyConnection) -> None:
-    conn.execute("INSTALL vss; LOAD vss;")
     conn.execute("SET hnsw_enable_experimental_persistence = true")
     try:
         conn.execute(
@@ -81,7 +80,6 @@ async def embed_texts(
     conn: duckdb.DuckDBPyConnection, config: Config, reset: bool = False
 ) -> int:
     dims = config.api.embedding_dims
-    conn.execute("INSTALL vss; LOAD vss;")
     ensure_embedding_column(conn, dims)
 
     if reset:

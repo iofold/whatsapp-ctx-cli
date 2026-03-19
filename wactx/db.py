@@ -10,6 +10,9 @@ from wactx.config import Config
 SCHEMA_VERSION = 1
 
 
+EXTENSIONS = ["vss", "duckpgq"]
+
+
 def get_connection(
     config: Config, read_only: bool = False
 ) -> duckdb.DuckDBPyConnection:
@@ -17,9 +20,25 @@ def get_connection(
     if not read_only:
         db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(db_path), read_only=read_only)
+    _load_extensions(conn)
     if not read_only:
         ensure_schema(conn)
     return conn
+
+
+EXTENSION_INSTALL = {
+    "vss": "INSTALL vss",
+    "duckpgq": "INSTALL duckpgq FROM community",
+}
+
+
+def _load_extensions(conn: duckdb.DuckDBPyConnection) -> None:
+    for ext in EXTENSIONS:
+        try:
+            conn.execute(EXTENSION_INSTALL.get(ext, f"INSTALL {ext}"))
+            conn.execute(f"LOAD {ext}")
+        except Exception:
+            pass
 
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
