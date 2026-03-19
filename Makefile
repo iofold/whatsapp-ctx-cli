@@ -1,20 +1,23 @@
-.PHONY: build install dev test clean build-all
+.PHONY: build install dev test clean build-all sync
 
 build:
-	python build_go.py
+	uv run python build_go.py
 
 install: build
-	pip install -e .
+	uv sync
 
 dev:
-	pip install -e ".[dev]"
+	uv sync --group dev
 
 test:
-	python -m pytest tests/ -v
+	uv run pytest tests/ -v
 
 clean:
-	rm -rf wactx/bin/ build/ dist/ *.egg-info .pytest_cache
+	rm -rf wactx/bin/whatsapp-sync* build/ dist/ *.egg-info .pytest_cache
 	find . -name __pycache__ -exec rm -rf {} +
 
 build-all:
-	python build_go.py --all
+	uv run python build_go.py --all
+
+sync:
+	uv run wactx sync

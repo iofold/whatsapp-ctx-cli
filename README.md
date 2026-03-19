@@ -151,12 +151,14 @@ Stack: Python · Go · DuckDB · DuckPGQ · DuckDB VSS · whatsmeow · OpenAI-co
 
 ## Development
 
+Requires [uv](https://docs.astral.sh/uv/) and Go 1.21+.
+
 ```bash
 git clone https://github.com/your-org/whatsapp-ctx-cli
 cd whatsapp-ctx-cli
 make build                    # compile Go binary
-make dev                      # pip install -e ".[dev]"
-make test                     # run tests
+make dev                      # uv sync --group dev
+make test                     # uv run pytest
 ```
 
 Cross-compile for all platforms:

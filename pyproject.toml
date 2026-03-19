@@ -12,14 +12,14 @@ dependencies = [
     "rich>=13.0",
 ]
 
-[project.optional-dependencies]
+[project.scripts]
+wactx = "wactx.cli:main"
+
+[dependency-groups]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
-
-[project.scripts]
-wactx = "wactx.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["wactx*"]
