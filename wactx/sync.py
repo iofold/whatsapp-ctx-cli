@@ -86,8 +86,51 @@ def _resolve_media_dir(config: Config) -> str:
     return str(config.db_path.parent / p)
 
 
+def _drop_hnsw_index(config: Config) -> bool:
+    import duckdb
+
+    db_path = config.db_path
+    if not db_path.exists():
+        return False
+    try:
+        conn = duckdb.connect(str(db_path))
+        conn.execute("INSTALL vss; LOAD vss")
+        conn.execute("DROP INDEX IF EXISTS idx_msg_embedding")
+        conn.close()
+        log.debug("Dropped HNSW index before sync")
+        return True
+    except Exception:
+        return False
+
+
+def _recreate_hnsw_index(config: Config) -> None:
+    import duckdb
+
+    try:
+        conn = duckdb.connect(str(config.db_path))
+        conn.execute("INSTALL vss; LOAD vss")
+        has_embeddings = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        if has_embeddings > 0:
+            conn.execute("SET hnsw_enable_experimental_persistence = true")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_msg_embedding "
+                "ON messages USING HNSW (embedding) WITH (metric = 'cosine')"
+            )
+            log.debug("Recreated HNSW index after sync")
+        conn.close()
+    except Exception as e:
+        log.debug(
+            "Could not recreate HNSW index (will be created on next 'wactx index'): %s",
+            e,
+        )
+
+
 def sync_whatsapp(config: Config, incremental: bool = True, live: bool = False) -> None:
     binary = _require_binary(config)
+
+    had_index = _drop_hnsw_index(config)
 
     cmd = [
         str(binary),
@@ -112,9 +155,11 @@ def sync_whatsapp(config: Config, incremental: bool = True, live: bool = False) 
         proc = subprocess.run(cmd, check=False)
         if proc.returncode != 0:
             log.error("Sync exited with code %d", proc.returncode)
-            sys.exit(proc.returncode)
     except KeyboardInterrupt:
         log.info("Sync interrupted")
+    finally:
+        if had_index:
+            _recreate_hnsw_index(config)
 
 
 def download_media(
