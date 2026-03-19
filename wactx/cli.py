@@ -181,8 +181,9 @@ def init(ctx):
 
     click.echo()
     click.echo("  Next:")
-    click.echo("    wactx sync                        # scan QR code on first run")
-    click.echo("    wactx index                       # embed messages")
+    click.echo(
+        "    wactx sync                        # scan QR, sync, and index automatically"
+    )
     click.echo('    wactx search "your query"         # search!')
 
 
@@ -201,19 +202,25 @@ def config_cmd(ctx, key, value):
 @click.option(
     "--live", is_flag=True, help="Keep running after sync (receive new messages)"
 )
+@click.option("--no-index", is_flag=True, help="Skip automatic embedding after sync")
 @click.pass_context
-def sync(ctx, full, live):
-    """Sync messages from WhatsApp via whatsmeow (primary method).
+def sync(ctx, full, live, no_index):
+    """Sync messages from WhatsApp, then embed new messages automatically.
 
     First run shows a QR code — scan it with WhatsApp on your phone.
     Subsequent runs sync incrementally by default.
-
-    Requires the whatsapp-sync binary. Set path with:
-      wactx config sync.binary_path /path/to/whatsapp-sync
     """
     from wactx.sync import sync_whatsapp
 
-    sync_whatsapp(ctx.obj["config"], incremental=not full, live=live)
+    cfg = ctx.obj["config"]
+    sync_whatsapp(cfg, incremental=not full, live=live)
+
+    if not no_index and cfg.api.key:
+        click.echo()
+        click.secho("Indexing new messages...", bold=True)
+        from wactx.embed import run_pipeline
+
+        asyncio.run(run_pipeline(cfg))
 
 
 @cli.command()
@@ -355,6 +362,46 @@ def stats(ctx):
     conn.close()
 
     render_stats(counts)
+
+
+@cli.command()
+@click.option("--yes", is_flag=True, help="Skip confirmation")
+@click.pass_context
+def clean(ctx, yes):
+    """Delete database, session, and all local data. Starts fresh."""
+    cfg = ctx.obj["config"]
+    targets = [
+        ("Database", cfg.db_path),
+        ("Database WAL", cfg.db_path.parent / (cfg.db_path.name + ".wal")),
+        ("WhatsApp session", cfg.db_path.parent / cfg.sync.wa_db_path),
+        ("Media directory", cfg.db_path.parent / cfg.sync.media_dir),
+    ]
+
+    existing = [(label, p) for label, p in targets if p.exists()]
+    if not existing:
+        click.echo("Nothing to clean.")
+        return
+
+    click.echo("Will delete:")
+    for label, p in existing:
+        click.echo(f"  {label}: {p}")
+    click.echo()
+
+    if not yes and not click.confirm("Are you sure?", default=False):
+        click.echo("Aborted.")
+        return
+
+    import shutil
+
+    for label, p in existing:
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+        click.secho(f"  ✓ Deleted {label}", fg="yellow")
+
+    click.echo()
+    click.echo("Clean. Run 'wactx init' to start fresh.")
 
 
 def main():
