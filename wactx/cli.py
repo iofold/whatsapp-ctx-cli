@@ -180,11 +180,31 @@ def init(ctx):
     _ensure_sync_binary(cfg)
 
     click.echo()
-    click.echo("  Next:")
-    click.echo(
-        "    wactx sync                        # scan QR, sync, and index automatically"
-    )
-    click.echo('    wactx search "your query"         # search!')
+    click.secho("Starting WhatsApp sync...", bold=True)
+    click.echo()
+
+    from wactx.sync import sync_whatsapp, find_binary
+
+    if find_binary(cfg):
+        sync_whatsapp(cfg, incremental=False, live=False)
+
+        if cfg.api.key:
+            click.echo()
+            click.secho("Indexing messages...", bold=True)
+            from wactx.embed import run_pipeline
+
+            asyncio.run(run_pipeline(cfg))
+
+        click.echo()
+        click.secho("  ✓ Setup complete!", fg="green", bold=True)
+        click.echo()
+        click.echo('  Try: wactx search "your query"')
+    else:
+        click.echo("  Sync binary not available — skipping initial sync.")
+        click.echo()
+        click.echo("  Next:")
+        click.echo("    wactx sync                        # scan QR, sync, and index")
+        click.echo('    wactx search "your query"         # search!')
 
 
 @cli.command("config")
