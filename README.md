@@ -6,18 +6,19 @@ Semantic + graph search over your WhatsApp messages. Built for founders with 100
 
 ## Quickstart
 
-```bash
-pip install whatsapp-ctx-cli
+Requires [uv](https://docs.astral.sh/uv/) and [Go](https://go.dev/dl/) 1.21+.
 
-wactx init
-wactx config api.base_url https://api.openai.com/v1
-wactx config api.key sk-your-key-here
-wactx sync                    # scan QR code on first run
-wactx index                   # embed messages
-wactx search "who knows about GTM consultants"
+```bash
+git clone https://github.com/your-org/whatsapp-ctx-cli
+cd whatsapp-ctx-cli
+uv sync
+uv run wactx init             # walks you through provider setup, builds Go binary
+uv run wactx sync             # scan QR code on first run
+uv run wactx index            # embed messages
+uv run wactx search "who knows about GTM consultants"
 ```
 
-The Go sync binary (whatsmeow) is bundled with the package — no separate install needed.
+`wactx init` is interactive — it asks for your API provider, key, and builds the WhatsApp sync binary automatically. No `make` or manual config needed.
 
 ## Search
 
@@ -151,20 +152,22 @@ Stack: Python · Go · DuckDB · DuckPGQ · DuckDB VSS · whatsmeow · OpenAI-co
 
 ## Development
 
-Requires [uv](https://docs.astral.sh/uv/) and Go 1.21+.
+Requires [uv](https://docs.astral.sh/uv/) and [Go](https://go.dev/dl/) 1.21+.
 
 ```bash
 git clone https://github.com/your-org/whatsapp-ctx-cli
 cd whatsapp-ctx-cli
-make build                    # compile Go binary
-make dev                      # uv sync --group dev
-make test                     # uv run pytest
+uv sync --group dev                     # install deps + dev tools
+uv run python build_go.py               # compile Go binary
+uv run pytest                           # run tests
 ```
 
 Cross-compile for all platforms:
 ```bash
-make build-all                # linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64
+uv run python build_go.py --all         # linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64
 ```
+
+A `Makefile` is included as a convenience but `uv` is all you need.
 
 ## License
 

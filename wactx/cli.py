@@ -27,11 +27,143 @@ def cli(ctx, config_path, verbose):
     ctx.obj["config_path"] = cfg_path
 
 
+GITHUB_RELEASE_URL = (
+    "https://github.com/your-org/whatsapp-ctx-cli/releases/latest/download"
+)
+
+
+def _ensure_sync_binary(cfg: Config) -> None:
+    from wactx.sync import find_binary, _PACKAGE_BIN, _platform_binary_name
+
+    if find_binary(cfg):
+        click.secho("  ✓ Sync binary found", fg="green")
+        return
+
+    click.echo()
+    click.echo("  WhatsApp sync binary not found. Building/downloading...")
+
+    import shutil
+    import subprocess
+    import platform as plat
+
+    go_bin = shutil.which("go")
+    if go_bin:
+        click.echo("  Go compiler found — building from source...")
+        try:
+            build_script = Path(__file__).resolve().parent.parent / "build_go.py"
+            if build_script.exists():
+                subprocess.run(
+                    ["uv", "run", "python", str(build_script)],
+                    check=True,
+                    capture_output=True,
+                )
+            else:
+                _PACKAGE_BIN.mkdir(parents=True, exist_ok=True)
+                go_src = Path(__file__).resolve().parent.parent / "whatsapp-sync"
+                output = _PACKAGE_BIN / "whatsapp-sync"
+                subprocess.run(
+                    [go_bin, "build", "-o", str(output), "."],
+                    cwd=str(go_src),
+                    check=True,
+                    capture_output=True,
+                    env={**__import__("os").environ, "CGO_ENABLED": "1"},
+                )
+                output.chmod(0o755)
+
+            if find_binary(cfg):
+                click.secho("  ✓ Sync binary built", fg="green")
+                return
+        except subprocess.CalledProcessError as e:
+            click.secho(
+                f"  Build failed: {e.stderr.decode()[:200] if e.stderr else e}",
+                fg="yellow",
+            )
+
+    click.echo("  Trying to download prebuilt binary...")
+    try:
+        import urllib.request
+
+        bin_name = _platform_binary_name()
+        url = f"{GITHUB_RELEASE_URL}/{bin_name}"
+        _PACKAGE_BIN.mkdir(parents=True, exist_ok=True)
+        dest = _PACKAGE_BIN / "whatsapp-sync"
+        urllib.request.urlretrieve(url, dest)
+        dest.chmod(0o755)
+        if find_binary(cfg):
+            click.secho("  ✓ Sync binary downloaded", fg="green")
+            return
+    except Exception:
+        pass
+
+    click.secho("  ⚠ Could not build or download sync binary.", fg="yellow")
+    click.echo("  You can build it manually:")
+    click.echo("    uv run python build_go.py")
+    click.echo("  Or set a custom path:")
+    click.echo("    wactx config sync.binary_path /path/to/whatsapp-sync")
+
+
+PROVIDERS = [
+    ("OpenAI", "https://api.openai.com/v1", "text-embedding-3-large", "gpt-5-mini"),
+    (
+        "Cloudflare AI Gateway",
+        "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat",
+        "openai/text-embedding-3-large",
+        "openai/gpt-5-mini",
+    ),
+    ("Ollama (local, free)", "http://localhost:11434/v1", "nomic-embed-text", "llama3"),
+    ("Custom endpoint", "", "", ""),
+]
+
+
 @cli.command()
 @click.pass_context
 def init(ctx):
-    """Initialize wactx: create config file and database."""
+    """Interactive setup: configure provider, API key, and create database."""
     cfg = ctx.obj["config"]
+
+    click.echo()
+    click.secho("  wactx — setup", bold=True)
+    click.echo()
+
+    click.echo("  Choose your LLM/embedding provider:\n")
+    for i, (name, url, _, _) in enumerate(PROVIDERS, 1):
+        hint = f"  ({url[:50]}…)" if len(url) > 50 else f"  ({url})" if url else ""
+        click.echo(f"    [{i}] {name}{hint}")
+    click.echo()
+
+    choice = click.prompt(
+        "  Provider", type=click.IntRange(1, len(PROVIDERS)), default=1
+    )
+    _, base_url, embed_model, chat_model = PROVIDERS[choice - 1]
+
+    if not base_url or "ACCOUNT_ID" in base_url:
+        base_url = click.prompt(
+            "  API base URL", default=base_url or "https://api.openai.com/v1"
+        )
+
+    cfg.api.base_url = base_url
+
+    api_key = click.prompt("  API key", default="", hide_input=False)
+    cfg.api.key = api_key
+
+    if embed_model:
+        use_default = click.confirm(f"  Embedding model: {embed_model}?", default=True)
+        if not use_default:
+            embed_model = click.prompt("  Embedding model", default=embed_model)
+    else:
+        embed_model = click.prompt(
+            "  Embedding model", default="text-embedding-3-large"
+        )
+    cfg.api.embedding_model = embed_model
+
+    if chat_model:
+        cfg.api.chat_model = chat_model
+
+    owner = click.prompt(
+        "  Your name (for graph insights — who are YOU in the chats)", default=""
+    )
+    cfg.search.owner_name = owner
+
     ensure_dirs(cfg)
     save_config(cfg, ctx.obj["config_path"])
 
@@ -41,18 +173,17 @@ def init(ctx):
     ensure_schema(conn)
     conn.close()
 
-    click.echo(f"Config:   {cfg.db_path}")
-    click.echo(f"Database: {cfg.db_path}")
     click.echo()
-    click.echo("Next steps:")
-    click.echo(
-        "  1. wactx config api.base_url https://your-openai-compatible-endpoint/v1"
-    )
-    click.echo("     wactx config api.key your-api-key")
+    click.secho("  ✓ Config saved", fg="green")
+    click.secho(f"  ✓ Database created at {cfg.db_path}", fg="green")
+
+    _ensure_sync_binary(cfg)
+
     click.echo()
-    click.echo("  2. wactx sync                       # scan QR code on first run")
-    click.echo("  3. wactx index                      # embed messages")
-    click.echo('  4. wactx search "your query"        # search!')
+    click.echo("  Next:")
+    click.echo("    wactx sync                        # scan QR code on first run")
+    click.echo("    wactx index                       # embed messages")
+    click.echo('    wactx search "your query"         # search!')
 
 
 @cli.command("config")
