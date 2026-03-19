@@ -103,12 +103,12 @@ def _ensure_sync_binary(cfg: Config) -> None:
 
 
 PROVIDERS = [
-    ("OpenAI", "https://api.openai.com/v1", "text-embedding-3-large", "gpt-5-mini"),
+    ("OpenAI", "https://api.openai.com/v1", "text-embedding-3-large", "gpt-4.1-nano"),
     (
         "Cloudflare AI Gateway",
         "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat",
         "openai/text-embedding-3-large",
-        "openai/gpt-5-mini",
+        "openai/gpt-4.1-nano",
     ),
     ("Ollama (local, free)", "http://localhost:11434/v1", "nomic-embed-text", "llama3"),
     ("Custom endpoint", "", "", ""),
