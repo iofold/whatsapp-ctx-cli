@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from wactx.config import Config
+from wactx.config import Config, history_sync_days
 
 log = logging.getLogger("wactx.sync")
 
@@ -98,6 +98,8 @@ def sync_whatsapp(config: Config, incremental: bool = True, live: bool = False) 
         _resolve_wa_db(config),
         "-timeout",
         config.sync.timeout,
+        "-history-days",
+        str(history_sync_days(config.sync)),
     ]
     if incremental:
         cmd.append("-incremental")

@@ -7,7 +7,14 @@ from pathlib import Path
 
 import click
 
-from wactx.config import Config, load_config, save_config, set_config_value, ensure_dirs
+from wactx.config import (
+    Config,
+    load_config,
+    save_config,
+    set_config_value,
+    ensure_dirs,
+    history_sync_days,
+)
 
 
 @click.group()
@@ -103,7 +110,7 @@ def _ensure_sync_binary(cfg: Config) -> None:
 
 
 PROVIDERS = [
-    ("OpenAI", "https://api.openai.com/v1", "text-embedding-3-large", "gpt-5-mini"),
+    ("OpenAI", "https://api.openai.com/v1", "text-embedding-3-small", "gpt-5-mini"),
     (
         "Cloudflare AI Gateway",
         "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat",
@@ -113,6 +120,26 @@ PROVIDERS = [
     ("Ollama (local, free)", "http://localhost:11434/v1", "nomic-embed-text", "llama3"),
     ("Custom endpoint", "", "", ""),
 ]
+
+HISTORY_SYNC_OPTIONS = [
+    ("1", "Last month", "1_month", 30, "~1-2 minutes"),
+    ("2", "Last 3 months", "3_months", 90, "~2-5 minutes"),
+    ("3", "Last year", "1_year", 365, "~5-15 minutes"),
+    ("4", "Last 3 years", "3_years", 1095, "~10-20 minutes"),
+    ("5", "Everything available", "all", 3650, "may take 15-30+ minutes"),
+]
+
+
+def _history_sync_timeout(config: Config) -> str:
+    days = history_sync_days(config.sync)
+    if days <= 30:
+        return "5m"
+    elif days <= 90:
+        return "10m"
+    elif days <= 365:
+        return "15m"
+    else:
+        return "30m"
 
 
 @cli.command()
@@ -152,7 +179,7 @@ def init(ctx):
             embed_model = click.prompt("  Embedding model", default=embed_model)
     else:
         embed_model = click.prompt(
-            "  Embedding model", default="text-embedding-3-large"
+            "  Embedding model", default="text-embedding-3-small"
         )
     cfg.api.embedding_model = embed_model
 
@@ -163,6 +190,19 @@ def init(ctx):
         "  Your name (for graph insights — who are YOU in the chats)", default=""
     )
     cfg.search.owner_name = owner
+
+    click.echo()
+    click.echo("  How much message history should we sync?\n")
+    for num, label, _, _, est in HISTORY_SYNC_OPTIONS:
+        click.echo(f"    [{num}] {label}  ({est})")
+    click.echo()
+
+    history_choice = click.prompt(
+        "  History depth", type=click.IntRange(1, len(HISTORY_SYNC_OPTIONS)), default=4
+    )
+    _, _, sync_key, _, est = HISTORY_SYNC_OPTIONS[history_choice - 1]
+    cfg.sync.history_sync = sync_key
+    cfg.sync.timeout = _history_sync_timeout(cfg)
 
     ensure_dirs(cfg)
     save_config(cfg, ctx.obj["config_path"])
@@ -182,6 +222,11 @@ def init(ctx):
     click.echo()
     click.secho("Starting WhatsApp sync...", bold=True)
     click.echo()
+    click.echo("  What to expect:")
+    click.echo("    1. A QR code will appear — scan it with WhatsApp on your phone")
+    click.echo("    2. Messages will stream in batches (you'll see progress)")
+    click.echo(f'    3. Look for "Sync complete" — estimated time: {est}')
+    click.echo()
 
     from wactx.sync import sync_whatsapp, find_binary
 
@@ -189,11 +234,9 @@ def init(ctx):
         sync_whatsapp(cfg, incremental=False, live=False)
 
         if cfg.api.key:
-            click.echo()
-            click.secho("Indexing messages...", bold=True)
-            from wactx.embed import run_pipeline
+            from wactx.pipeline import run_post_sync
 
-            asyncio.run(run_pipeline(cfg))
+            run_post_sync(cfg)
 
         click.echo()
         click.secho("  ✓ Setup complete!", fg="green", bold=True)
@@ -222,10 +265,14 @@ def config_cmd(ctx, key, value):
 @click.option(
     "--live", is_flag=True, help="Keep running after sync (receive new messages)"
 )
-@click.option("--no-index", is_flag=True, help="Skip automatic embedding after sync")
+@click.option(
+    "--no-post-process",
+    is_flag=True,
+    help="Skip indexing, enrichment, and graph after sync",
+)
 @click.pass_context
-def sync(ctx, full, live, no_index):
-    """Sync messages from WhatsApp, then embed new messages automatically.
+def sync(ctx, full, live, no_post_process):
+    """Sync messages from WhatsApp, then index, enrich, and build graph.
 
     First run shows a QR code — scan it with WhatsApp on your phone.
     Subsequent runs sync incrementally by default.
@@ -235,12 +282,10 @@ def sync(ctx, full, live, no_index):
     cfg = ctx.obj["config"]
     sync_whatsapp(cfg, incremental=not full, live=live)
 
-    if not no_index and cfg.api.key:
-        click.echo()
-        click.secho("Indexing new messages...", bold=True)
-        from wactx.embed import run_pipeline
+    if not no_post_process and cfg.api.key:
+        from wactx.pipeline import run_post_sync
 
-        asyncio.run(run_pipeline(cfg))
+        run_post_sync(cfg)
 
 
 @cli.command()
@@ -293,8 +338,12 @@ def enrich(ctx, process_all):
 def graph(ctx):
     """Build relationship graph (DuckPGQ property graph)."""
     from wactx.graph import build_graph
+    from wactx.db import get_connection
 
-    counts = build_graph(ctx.obj["config"])
+    cfg = ctx.obj["config"]
+    conn = get_connection(cfg)
+    counts = build_graph(conn, cfg)
+    conn.close()
     click.echo("Graph built:")
     for name, count in sorted(counts.items()):
         click.echo(f"  {name:35s} {count:,}")

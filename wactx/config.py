@@ -14,10 +14,19 @@ DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "wactx" / "messages.duckdb"
 class ApiConfig:
     base_url: str = "https://api.openai.com/v1"
     key: str = ""
-    embedding_model: str = "text-embedding-3-large"
+    embedding_model: str = "text-embedding-3-small"
     embedding_dims: int = 384
     chat_model: str = "gpt-5-mini"
-    max_concurrent: int = 5
+    max_concurrent: int = 10
+
+
+HISTORY_DAYS_MAP: dict[str, int] = {
+    "1_month": 30,
+    "3_months": 90,
+    "1_year": 365,
+    "3_years": 1095,
+    "all": 3650,
+}
 
 
 @dataclass
@@ -26,6 +35,11 @@ class SyncConfig:
     wa_db_path: str = "whatsmeow.db"
     media_dir: str = "media"
     timeout: str = "5m"
+    history_sync: str = "3_years"
+
+
+def history_sync_days(sync_cfg: SyncConfig) -> int:
+    return HISTORY_DAYS_MAP.get(sync_cfg.history_sync, 1095)
 
 
 @dataclass
@@ -128,6 +142,10 @@ def load_config(path: Path | str | None = None) -> Config:
             timeout=_as_str(
                 sync_data.get("timeout", cfg.sync.timeout), field_name="sync.timeout"
             ),
+            history_sync=_as_str(
+                sync_data.get("history_sync", cfg.sync.history_sync),
+                field_name="sync.history_sync",
+            ),
         )
 
     search_data = data.get("search", {})
@@ -169,6 +187,7 @@ def _dump_toml_manual(config: Config) -> str:
             f'wa_db_path = "{esc(config.sync.wa_db_path)}"',
             f'media_dir = "{esc(config.sync.media_dir)}"',
             f'timeout = "{esc(config.sync.timeout)}"',
+            f'history_sync = "{esc(config.sync.history_sync)}"',
             "",
             "[search]",
             f'default_depth = "{esc(config.search.default_depth)}"',
@@ -199,6 +218,7 @@ def save_config(config: Config, path: Path | str | None = None) -> None:
             "wa_db_path": config.sync.wa_db_path,
             "media_dir": config.sync.media_dir,
             "timeout": config.sync.timeout,
+            "history_sync": config.sync.history_sync,
         },
         "search": {
             "default_depth": config.search.default_depth,
