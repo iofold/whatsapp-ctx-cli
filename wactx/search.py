@@ -642,7 +642,7 @@ def run_search(
                 ]
             )
 
-            candidates = candidates[: max(top_k, top_k * 3 - i * top_k)]
+            candidates = candidates[: max(top_k * 2, int(top_k * 3 * (0.85**i)))]
 
     candidates = candidates[: top_k * 4]
 
