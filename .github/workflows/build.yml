@@ -40,14 +40,15 @@ jobs:
         if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Build Go binary
+        shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: ${{ matrix.goos == 'windows' && '0' || '1' }}
+          CGO_ENABLED: "1"
         run: |
           cd whatsapp-sync
           BINARY_NAME="whatsapp-sync-${{ matrix.goos }}-${{ matrix.goarch }}"
