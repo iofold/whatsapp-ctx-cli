@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
+import importlib
+import re
 import time
-from collections import defaultdict
-from collections.abc import Iterable
 
 import duckdb
-from openai import AsyncOpenAI
 
 from wactx.config import Config
 from wactx.db import table_exists
@@ -17,28 +14,38 @@ log = logging.getLogger("wactx.entities")
 
 ENTITY_TYPES = ["person", "org", "tech", "url", "event"]
 
-SYSTEM_PROMPT = """\
-You are an entity extractor for WhatsApp group messages in tech/founder/AI communities.
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+_MENTION_RE = re.compile(r"@(\+?\d[\d\s\-]{5,}\d|[\w.]+)", re.UNICODE)
 
-Extract named entities from each message. Return a JSON array with one object per message.
+_SPACY_TO_ENTITY_TYPE: dict[str, str] = {
+    "PERSON": "person",
+    "ORG": "org",
+    "GPE": "org",
+    "EVENT": "event",
+    "PRODUCT": "tech",
+    "WORK_OF_ART": "tech",
+    "DATE": "event",
+    "FAC": "org",
+}
 
-Entity types:
-- persons: Names of people mentioned (not the sender themselves)
-- orgs: Companies, organizations, funds, accelerators, universities
-- techs: Technologies, tools, frameworks, programming languages, AI models
-- urls: URLs or domains mentioned
-- events: Named events, conferences, meetups, demo days
+_NLP = None
 
-Rules:
-- Return JSON array ONLY — no markdown, no code fences, no explanation
-- Each element: {"id": "<message_id>", "persons": [...], "orgs": [...], "techs": [...], "urls": [...], "events": [...]} 
-- Empty arrays for categories with no matches
-- Normalize names: "GCP" → "Google Cloud", "k8s" → "Kubernetes", "LLM" → keep as "LLM"
-- Skip generic terms: "the app", "the company", "a startup", "their team"
-- Skip the sender's own name
-- For URLs, extract the full URL if present, or just the domain
-- Be conservative — only extract clearly named entities, not descriptions
-"""
+
+def _get_nlp():
+    global _NLP
+    if _NLP is not None:
+        return _NLP
+    try:
+        spacy = importlib.import_module("spacy")
+        _NLP = spacy.load("en_core_web_sm", enable=["ner"])
+    except OSError:
+        log.warning(
+            "SpaCy model not found. Install with: uv pip install en-core-web-sm@https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+        )
+        spacy = importlib.import_module("spacy")
+        _NLP = spacy.blank("en")
+    return _NLP
 
 
 def ensure_entity_table(conn: duckdb.DuckDBPyConnection) -> None:
@@ -65,98 +72,46 @@ def ensure_entity_table(conn: duckdb.DuckDBPyConnection) -> None:
     """)
 
 
-def _parse_response(
-    raw: str, id_to_chat: dict[str, str]
-) -> list[tuple[str, str, str, str]]:
-    payload = raw.strip()
-    if not payload:
-        return []
+def _extract_regex(text: str) -> list[tuple[str, str]]:
+    entities: list[tuple[str, str]] = []
+    for url in _URL_RE.findall(text):
+        entities.append(("url", url.rstrip(".,;:!?)'\"")))
+    for email in _EMAIL_RE.findall(text):
+        entities.append(("url", email))
+    for mention in _MENTION_RE.findall(text):
+        mention = mention.strip()
+        if len(mention) > 2:
+            entities.append(("person", "@" + mention))
+    return entities
 
-    if payload.startswith("```"):
-        payload = payload.split("\n", 1)[1] if "\n" in payload else payload[3:]
-        if payload.endswith("```"):
-            payload = payload[:-3]
-        payload = payload.strip()
 
-    parsed = json.loads(payload)
-    if not isinstance(parsed, list):
-        return []
+def _extract_spacy(
+    texts: list[str], sender_names: list[str]
+) -> list[list[tuple[str, str]]]:
+    nlp = _get_nlp()
+    if not nlp.has_pipe("ner"):
+        return [[] for _ in texts]
 
-    rows: list[tuple[str, str, str, str]] = []
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        message_id = str(item.get("id", ""))
-        chat_jid = id_to_chat.get(message_id, "")
-        if not chat_jid:
-            continue
-        for plural_key, singular in [
-            ("persons", "person"),
-            ("orgs", "org"),
-            ("techs", "tech"),
-            ("urls", "url"),
-            ("events", "event"),
-        ]:
-            values = item.get(plural_key, [])
-            if not isinstance(values, Iterable):
+    results: list[list[tuple[str, str]]] = []
+    sender_set = {n.lower().strip() for n in sender_names if n}
+
+    for doc in nlp.pipe(texts, batch_size=256):
+        entities: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for ent in doc.ents:
+            etype = _SPACY_TO_ENTITY_TYPE.get(ent.label_)
+            if not etype:
                 continue
-            for value in values:
-                if isinstance(value, str) and len(value.strip()) > 1:
-                    rows.append((message_id, chat_jid, singular, value.strip()[:200]))
-
-    return rows
-
-
-async def _extract_batch(
-    client: AsyncOpenAI,
-    sem: asyncio.Semaphore,
-    model: str,
-    batch: list[dict],
-    batch_idx: int,
-    total: int,
-) -> list[tuple[str, str, str, str]]:
-    async with sem:
-        prompt_lines: list[str] = []
-        id_to_chat: dict[str, str] = {}
-        for m in batch:
-            text = m["text"][:500]
-            prompt_lines.append(f"[{m['id']}] ({m['group']}) {m['sender']}: {text}")
-            id_to_chat[m["id"]] = m["chat_jid"]
-
-        for attempt in range(3):
-            try:
-                resp = await client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": "\n".join(prompt_lines)},
-                    ],
-                    max_completion_tokens=4096,
-                )
-                raw = resp.choices[0].message.content or ""
-                results = _parse_response(raw, id_to_chat)
-
-                if (batch_idx + 1) % 10 == 0 or batch_idx + 1 == total:
-                    log.info(
-                        "  Batch %d/%d: %d entities", batch_idx + 1, total, len(results)
-                    )
-                return results
-
-            except json.JSONDecodeError as e:
-                log.warning(
-                    "Batch %d JSON parse failed (attempt %d/3): %s",
-                    batch_idx + 1,
-                    attempt + 1,
-                    e,
-                )
-                if attempt == 2:
-                    return []
-            except Exception as e:
-                log.warning("Batch %d attempt %d: %s", batch_idx + 1, attempt + 1, e)
-                await asyncio.sleep(2 ** (attempt + 1))
-                if attempt == 2:
-                    return []
-    return []
+            value = ent.text.strip()
+            if len(value) < 2 or value.lower() in sender_set:
+                continue
+            key = (etype, value.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            entities.append((etype, value[:200]))
+        results.append(entities)
+    return results
 
 
 async def extract_entities(
@@ -164,78 +119,47 @@ async def extract_entities(
 ) -> int:
     ensure_entity_table(conn)
 
-    where_extra = ""
+    where_skip = ""
     if not process_all:
-        where_extra = (
-            " AND m.id NOT IN (SELECT DISTINCT message_id FROM extracted_entities)"
-            " AND cl.category NOT IN ('banter', 'other')"
-        )
-
-    has_cl = table_exists(conn, "classifications")
-    if not has_cl and not process_all:
-        log.info("No classifications table — extracting from all group messages")
-        where_extra = (
+        where_skip = (
             " AND m.id NOT IN (SELECT DISTINCT message_id FROM extracted_entities)"
         )
-
-    join_cl = (
-        "LEFT JOIN classifications cl ON m.id = cl.message_id AND m.chat_jid = cl.chat_jid"
-        if has_cl
-        else ""
-    )
-    where_cl = "AND cl.message_id IS NOT NULL" if has_cl and not process_all else ""
 
     rows = conn.execute(f"""
-        SELECT m.id, m.chat_jid, m.push_name, m.text_content,
-               COALESCE(c.group_name, m.chat_jid) AS group_name
+        SELECT m.id, m.chat_jid, m.push_name, m.text_content
         FROM messages m
-        LEFT JOIN contacts c ON m.chat_jid = c.jid
-        {join_cl}
         WHERE m.is_group = true
           AND m.text_content IS NOT NULL
           AND TRIM(m.text_content) != ''
-          {where_cl}
-          {where_extra}
+          {where_skip}
         ORDER BY m.chat_jid, m.timestamp ASC
     """).fetchall()
 
-    messages = [
-        {
-            "id": r[0],
-            "chat_jid": r[1],
-            "sender": r[2] or "Unknown",
-            "text": r[3],
-            "group": r[4],
-        }
-        for r in rows
-    ]
-
-    if not messages:
+    if not rows:
         log.info("No messages to extract entities from")
         return 0
 
-    log.info("Extracting entities from %d messages...", len(messages))
-
-    by_chat: dict[str, list[dict]] = defaultdict(list)
-    for message in messages:
-        by_chat[message["chat_jid"]].append(message)
-
-    batches: list[list[dict]] = []
-    for chat_messages in by_chat.values():
-        for i in range(0, len(chat_messages), 40):
-            batches.append(chat_messages[i : i + 40])
-
-    client = AsyncOpenAI(base_url=config.api.base_url, api_key=config.api.key)
-    sem = asyncio.Semaphore(config.api.max_concurrent)
-
+    log.info("Extracting entities from %d messages (local NER)...", len(rows))
     t0 = time.time()
-    tasks = [
-        _extract_batch(client, sem, config.api.chat_model, b, i, len(batches))
-        for i, b in enumerate(batches)
-    ]
-    all_results = await asyncio.gather(*tasks)
 
-    flat = [r for batch_results in all_results for r in batch_results]
+    msg_ids = [r[0] for r in rows]
+    chat_jids = [r[1] for r in rows]
+    senders = [r[2] or "" for r in rows]
+    texts = [r[3] for r in rows]
+
+    spacy_results = _extract_spacy(texts, senders)
+
+    flat: list[tuple[str, str, str, str]] = []
+    for i, text in enumerate(texts):
+        msg_id = msg_ids[i]
+        chat_jid = chat_jids[i]
+
+        for etype, evalue in _extract_regex(text):
+            flat.append((msg_id, chat_jid, etype, evalue))
+
+        for etype, evalue in spacy_results[i]:
+            flat.append((msg_id, chat_jid, etype, evalue))
+
     elapsed = time.time() - t0
     log.info("Extracted %d entity mentions in %.1fs", len(flat), elapsed)
 
@@ -269,13 +193,6 @@ def get_entity_stats(conn: duckdb.DuckDBPyConnection) -> dict:
     messages_row = conn.execute(
         "SELECT COUNT(DISTINCT message_id) FROM extracted_entities"
     ).fetchone()
-    if total_row is None:
-        stats["total"] = 0
-    else:
-        stats["total"] = int(total_row[0])
-
-    if messages_row is None:
-        stats["messages"] = 0
-    else:
-        stats["messages"] = int(messages_row[0])
+    stats["total"] = int(total_row[0]) if total_row else 0
+    stats["messages"] = int(messages_row[0]) if messages_row else 0
     return stats
