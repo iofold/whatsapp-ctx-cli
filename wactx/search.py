@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 import logging
 import time
@@ -12,9 +13,9 @@ from wactx.config import Config
 log = logging.getLogger("wactx.search")
 
 DEPTH_PRESETS = {
-    "fast": {"variants": 1, "top": 10, "graph": False},
-    "balanced": {"variants": 5, "top": 15, "graph": True},
-    "deep": {"variants": 8, "top": 30, "graph": True},
+    "fast": {"variants": 1, "top": 10, "graph": False, "iterations": 1},
+    "balanced": {"variants": 5, "top": 15, "graph": True, "iterations": 3},
+    "deep": {"variants": 8, "top": 30, "graph": True, "iterations": 3},
 }
 
 QUERY_EXPANSION_PROMPT = """\
@@ -71,6 +72,37 @@ def embed_queries(
     return [e.embedding for e in resp.data]
 
 
+def bm25_search(conn: duckdb.DuckDBPyConnection, query: str, top_k: int) -> list[dict]:
+    try:
+        rows = conn.execute(
+            """SELECT m.id, m.text_content, m.push_name, m.sender_jid, m.chat_jid,
+                      m.timestamp, m.media_type, m.media_path,
+                      fts_main_messages.match_bm25(m.id, ?, fields := 'text_content') AS score
+               FROM messages m
+               WHERE score IS NOT NULL
+               ORDER BY score
+               LIMIT ?""",
+            [query, top_k],
+        ).fetchall()
+    except Exception:
+        return []
+
+    return [
+        {
+            "id": r[0],
+            "text": r[1],
+            "sender": r[2],
+            "sender_jid": r[3],
+            "chat_jid": r[4],
+            "time": r[5],
+            "media_type": r[6],
+            "media_path": r[7],
+            "bm25_score": float(r[8]) if r[8] else 0.0,
+        }
+        for r in rows
+    ]
+
+
 def semantic_search(
     conn: duckdb.DuckDBPyConnection, vectors: list[list[float]], dims: int, top_k: int
 ) -> list[dict]:
@@ -103,7 +135,132 @@ def semantic_search(
     ]
 
 
-def enrich_basic(conn: duckdb.DuckDBPyConnection, results: list[dict]) -> list[dict]:
+def rrf_fuse(rankings: list[tuple[str, list[dict]]], k: int = 60) -> list[dict]:
+    scores: dict[str, float] = defaultdict(float)
+    docs: dict[str, dict] = {}
+    for _name, results in rankings:
+        for rank, doc in enumerate(results):
+            doc_id = doc["id"]
+            scores[doc_id] += 1.0 / (k + rank + 1)
+            if doc_id not in docs:
+                docs[doc_id] = doc
+
+    fused = []
+    for doc_id, score in sorted(scores.items(), key=lambda x: -x[1]):
+        doc = docs[doc_id]
+        doc["rrf_score"] = score
+        doc.setdefault("similarity", 0.0)
+        fused.append(doc)
+    return fused
+
+
+def graph_expand_candidates(
+    conn: duckdb.DuckDBPyConnection,
+    seed_jids: list[str],
+    vectors: list[list[float]],
+    dims: int,
+    top_k: int = 20,
+) -> list[dict]:
+    from wactx.db import table_exists
+
+    if not table_exists(conn, "graph_persons") or not seed_jids:
+        return []
+
+    placeholders = ", ".join(["?"] * len(seed_jids))
+
+    try:
+        neighbour_rows = conn.execute(
+            f"""
+            WITH seed AS (
+                SELECT person_id FROM graph_persons WHERE source_id IN ({placeholders})
+            ),
+            via_dm AS (
+                SELECT CASE
+                    WHEN epm.sender_person_id IN (SELECT person_id FROM seed)
+                    THEN epm.receiver_person_id ELSE epm.sender_person_id
+                END AS person_id, epm.message_count AS weight
+                FROM edge_person_messaged epm
+                WHERE epm.sender_person_id IN (SELECT person_id FROM seed)
+                   OR epm.receiver_person_id IN (SELECT person_id FROM seed)
+            ),
+            via_group AS (
+                SELECT e2.person_id, e2.message_count AS weight
+                FROM edge_person_in_group e1
+                JOIN edge_person_in_group e2 ON e1.group_jid = e2.group_jid
+                WHERE e1.person_id IN (SELECT person_id FROM seed)
+                  AND e2.person_id NOT IN (SELECT person_id FROM seed)
+            ),
+            all_neighbours AS (
+                SELECT person_id, SUM(weight) AS total_weight
+                FROM (SELECT * FROM via_dm UNION ALL SELECT * FROM via_group) combined
+                WHERE person_id NOT IN (SELECT person_id FROM seed)
+                GROUP BY person_id
+            )
+            SELECT gp.source_id
+            FROM all_neighbours an
+            JOIN graph_persons gp ON an.person_id = gp.person_id
+            ORDER BY an.total_weight DESC
+            LIMIT 20
+            """,
+            seed_jids,
+        ).fetchall()
+    except Exception:
+        return []
+
+    if not neighbour_rows:
+        return []
+
+    neighbour_jids = [r[0] for r in neighbour_rows]
+    n_placeholders = ", ".join(["?"] * len(neighbour_jids))
+
+    expanded = []
+    for qvec in vectors[:2]:
+        try:
+            rows = conn.execute(
+                f"""SELECT id, text_content, push_name, sender_jid, chat_jid, timestamp,
+                           media_type, media_path,
+                           array_cosine_similarity(embedding, ?::FLOAT[{dims}]) AS similarity
+                    FROM messages
+                    WHERE embedding IS NOT NULL
+                      AND sender_jid IN ({n_placeholders})
+                    ORDER BY similarity DESC LIMIT ?""",
+                [qvec] + neighbour_jids + [top_k],
+            ).fetchall()
+        except Exception:
+            continue
+
+        for r in rows:
+            expanded.append(
+                {
+                    "id": r[0],
+                    "text": r[1],
+                    "sender": r[2],
+                    "sender_jid": r[3],
+                    "chat_jid": r[4],
+                    "time": r[5],
+                    "media_type": r[6],
+                    "media_path": r[7],
+                    "similarity": float(r[8]),
+                }
+            )
+
+    seen = set()
+    unique = []
+    for doc in expanded:
+        if doc["id"] not in seen:
+            seen.add(doc["id"])
+            unique.append(doc)
+    return unique
+
+
+def enrich_results(
+    conn: duckdb.DuckDBPyConnection,
+    results: list[dict],
+    owner_name: str,
+    use_graph: bool,
+) -> list[dict]:
+    from wactx.db import table_exists
+
     for r in results:
         row = conn.execute(
             "SELECT COALESCE(group_name, push_name, jid), is_group FROM contacts WHERE jid = ?",
@@ -122,52 +279,84 @@ def enrich_basic(conn: duckdb.DuckDBPyConnection, results: list[dict]) -> list[d
             r["display_name"] = r["sender"] or "?"
             r["phone"] = _phone_from_jid(r["sender_jid"])
 
-        r["dm_volume"] = 0
-        r["shared_groups"] = []
-        r["entities"] = []
+        r.setdefault("dm_volume", 0)
+        r.setdefault("shared_groups", [])
+        r.setdefault("entities", [])
+
+        if not use_graph:
+            continue
+
+        try:
+            dm = conn.execute(
+                """SELECT COALESCE(SUM(message_count), 0)
+                   FROM edge_person_messaged epm
+                   JOIN graph_persons gp ON (epm.sender_person_id = gp.person_id OR epm.receiver_person_id = gp.person_id)
+                   WHERE gp.source_id = ?""",
+                [r["sender_jid"]],
+            ).fetchone()
+            r["dm_volume"] = dm[0] if dm else 0
+        except Exception:
+            pass
+
+        try:
+            if owner_name:
+                shared = conn.execute(
+                    """SELECT LIST(DISTINCT gg.group_name)
+                       FROM edge_person_in_group e1
+                       JOIN edge_person_in_group e2 ON e1.group_jid = e2.group_jid
+                       JOIN graph_groups gg ON e1.group_jid = gg.group_jid
+                       JOIN graph_persons gp1 ON e1.person_id = gp1.person_id
+                       JOIN graph_persons gp2 ON e2.person_id = gp2.person_id
+                       WHERE gp1.source_id = ? AND gp2.display_name = ?""",
+                    [r["sender_jid"], owner_name],
+                ).fetchone()
+                r["shared_groups"] = shared[0] if shared and shared[0] else []
+        except Exception:
+            pass
+
+        try:
+            if table_exists(conn, "edge_person_mentions_entity"):
+                entities = conn.execute(
+                    """SELECT ge.entity_type, ge.entity_value, epm.mention_count
+                       FROM edge_person_mentions_entity epm
+                       JOIN graph_entities ge ON epm.entity_id = ge.entity_id
+                       JOIN graph_persons gp ON epm.person_id = gp.person_id
+                       WHERE gp.source_id = ?
+                       ORDER BY epm.mention_count DESC LIMIT 5""",
+                    [r["sender_jid"]],
+                ).fetchall()
+                r["entities"] = [(t, v, c) for t, v, c in entities]
+        except Exception:
+            pass
+
     return results
 
 
-def enrich_with_graph(
-    conn: duckdb.DuckDBPyConnection, results: list[dict], owner_name: str
+def fetch_conversation_context(
+    conn: duckdb.DuckDBPyConnection, results: list[dict], limit: int = 10
 ) -> list[dict]:
-    results = enrich_basic(conn, results)
-    from wactx.db import table_exists
-
-    for r in results:
-        dm = conn.execute(
-            """SELECT COALESCE(SUM(message_count), 0)
-               FROM edge_person_messaged epm
-               JOIN graph_persons gp ON (epm.sender_person_id = gp.person_id OR epm.receiver_person_id = gp.person_id)
-               WHERE gp.source_id = ?""",
-            [r["sender_jid"]],
-        ).fetchone()
-        r["dm_volume"] = dm[0] if dm else 0
-
-        if owner_name:
-            shared = conn.execute(
-                """SELECT LIST(DISTINCT gg.group_name)
-                   FROM edge_person_in_group e1
-                   JOIN edge_person_in_group e2 ON e1.group_jid = e2.group_jid
-                   JOIN graph_groups gg ON e1.group_jid = gg.group_jid
-                   JOIN graph_persons gp1 ON e1.person_id = gp1.person_id
-                   JOIN graph_persons gp2 ON e2.person_id = gp2.person_id
-                   WHERE gp1.source_id = ? AND gp2.display_name = ?""",
-                [r["sender_jid"], owner_name],
-            ).fetchone()
-            r["shared_groups"] = shared[0] if shared and shared[0] else []
-
-        if table_exists(conn, "edge_person_mentions_entity"):
-            entities = conn.execute(
-                """SELECT ge.entity_type, ge.entity_value, epm.mention_count
-                   FROM edge_person_mentions_entity epm
-                   JOIN graph_entities ge ON epm.entity_id = ge.entity_id
-                   JOIN graph_persons gp ON epm.person_id = gp.person_id
-                   WHERE gp.source_id = ?
-                   ORDER BY epm.mention_count DESC LIMIT 5""",
-                [r["sender_jid"]],
+    for r in results[:limit]:
+        try:
+            thread = conn.execute(
+                """SELECT push_name, text_content, timestamp
+                   FROM messages
+                   WHERE chat_jid = ?
+                     AND timestamp BETWEEN ?::TIMESTAMPTZ - INTERVAL '1 hour'
+                                       AND ?::TIMESTAMPTZ + INTERVAL '1 hour'
+                     AND text_content IS NOT NULL
+                   ORDER BY timestamp
+                   LIMIT 10""",
+                [r["chat_jid"], r["time"], r["time"]],
             ).fetchall()
-            r["entities"] = [(t, v, c) for t, v, c in entities]
+            r["conversation_thread"] = (
+                [{"sender": t[0] or "?", "text": t[1], "time": t[2]} for t in thread]
+                if thread
+                else []
+            )
+        except Exception:
+            r["conversation_thread"] = []
+
+        r["conversation_boost"] = min(1.0, len(r.get("conversation_thread", [])) / 8.0)
     return results
 
 
@@ -177,32 +366,44 @@ def find_related_people(results: list[dict]) -> list[dict]:
         jid = r["sender_jid"]
         if jid not in by_person:
             by_person[jid] = {
-                "display_name": r["display_name"],
+                "display_name": r.get("display_name", r.get("sender", "?")),
                 "phone": r.get("phone", ""),
                 "sender_jid": jid,
-                "max_similarity": r["similarity"],
+                "max_similarity": r.get("similarity", 0.0),
+                "max_rrf": r.get("rrf_score", 0.0),
                 "message_count": 0,
                 "dm_volume": r.get("dm_volume", 0),
                 "shared_groups": r.get("shared_groups", []),
                 "entities": r.get("entities", []),
+                "conversation_boost": r.get("conversation_boost", 0.0),
                 "messages": [],
             }
         p = by_person[jid]
         p["message_count"] += 1
-        p["max_similarity"] = max(p["max_similarity"], r["similarity"])
+        p["max_similarity"] = max(p["max_similarity"], r.get("similarity", 0.0))
+        p["max_rrf"] = max(p["max_rrf"], r.get("rrf_score", 0.0))
+        p["conversation_boost"] = max(
+            p["conversation_boost"], r.get("conversation_boost", 0.0)
+        )
+        if r.get("dm_volume", 0) > p["dm_volume"]:
+            p["dm_volume"] = r["dm_volume"]
+        if len(r.get("shared_groups", [])) > len(p["shared_groups"]):
+            p["shared_groups"] = r["shared_groups"]
+        if len(r.get("entities", [])) > len(p["entities"]):
+            p["entities"] = r["entities"]
         p["messages"].append(r)
 
-    # score = 0.6 × semantic + 0.4 × graph_proximity
     for p in by_person.values():
+        retrieval = max(p["max_rrf"] * 100, p["max_similarity"])
         graph = min(
             1.0,
-            (
-                (0.3 if p["dm_volume"] > 0 else 0)
-                + (0.1 * min(3, len(p["shared_groups"])))
-                + (0.1 * min(3, p["message_count"]))
-            ),
+            (0.3 if p["dm_volume"] > 0 else 0)
+            + 0.1 * min(3, len(p["shared_groups"]))
+            + 0.1 * min(3, p["message_count"])
+            + 0.05 * min(3, len(p["entities"])),
         )
-        p["score"] = 0.6 * p["max_similarity"] + 0.4 * graph
+        conv = p["conversation_boost"]
+        p["score"] = 0.50 * retrieval + 0.30 * graph + 0.20 * conv
 
     return sorted(by_person.values(), key=lambda x: x["score"], reverse=True)
 
@@ -277,24 +478,42 @@ def run_search(
     n_variants = variants if variants is not None else preset["variants"]
     top_k = top if top is not None else preset["top"]
     use_graph = preset["graph"] and not no_graph
+    iterations = preset.get("iterations", 1)
 
     client = OpenAI(base_url=config.api.base_url, api_key=config.api.key)
     t0 = time.time()
 
     queries = expand_query(client, config, query, n_variants)
     vectors = embed_queries(client, config, queries)
-    results = semantic_search(conn, vectors, config.api.embedding_dims, top_k)
 
-    if use_graph:
-        try:
-            results = enrich_with_graph(conn, results, config.search.owner_name)
-        except Exception:
-            results = enrich_basic(conn, results)
-            use_graph = False
+    bm25_results = bm25_search(conn, query, top_k=top_k * 3)
+    vector_results = semantic_search(
+        conn, vectors, config.api.embedding_dims, top_k * 3
+    )
+
+    if bm25_results:
+        candidates = rrf_fuse([("bm25", bm25_results), ("vector", vector_results)])
     else:
-        results = enrich_basic(conn, results)
+        candidates = vector_results
+        for doc in candidates:
+            doc["rrf_score"] = doc.get("similarity", 0.0)
 
-    people = find_related_people(results)
+    if use_graph and iterations >= 2 and len(candidates) > 0:
+        seed_jids = list({c["sender_jid"] for c in candidates[:20]})
+        expanded = graph_expand_candidates(
+            conn, seed_jids, vectors, config.api.embedding_dims, top_k=top_k
+        )
+        if expanded:
+            all_rankings = [("iteration1", candidates), ("graph_expanded", expanded)]
+            candidates = rrf_fuse(all_rankings)
+
+    candidates = candidates[: top_k * 4]
+    candidates = enrich_results(conn, candidates, config.search.owner_name, use_graph)
+
+    if iterations >= 3:
+        candidates = fetch_conversation_context(conn, candidates, limit=top_k)
+
+    people = find_related_people(candidates)
     insights = (
         compute_graph_insights(conn, people[:15], config.search.owner_name)
         if use_graph
@@ -308,6 +527,6 @@ def run_search(
         "use_graph": use_graph,
         "elapsed": time.time() - t0,
         "people": people,
-        "messages": results,
+        "messages": candidates[:top_k],
         "insights": insights,
     }

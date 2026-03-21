@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, cast
 
@@ -121,6 +122,22 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         """,
         [str(SCHEMA_VERSION)],
     )
+    ensure_fts_index(conn)
+
+
+def ensure_fts_index(conn: duckdb.DuckDBPyConnection) -> None:
+    try:
+        conn.execute("INSTALL fts")
+        conn.execute("LOAD fts")
+    except Exception:
+        pass
+    try:
+        conn.execute(
+            "PRAGMA create_fts_index('messages', 'id', 'text_content', "
+            "stemmer='english', stopwords='english', overwrite=1)"
+        )
+    except Exception as e:
+        logging.getLogger("wactx.db").warning("FTS index creation failed: %s", e)
 
 
 def table_exists(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:

@@ -80,24 +80,29 @@ def render_search_results(data: dict) -> None:
     if use_graph and insights:
         _render_graph_insights(insights, w)
 
+    thread_w = 10
+    msg_table_w = max(30, w - 42 - thread_w)
     mtable = Table(
         title="\U0001f4ac Messages", show_lines=True, width=w, pad_edge=False
     )
     mtable.add_column("#", style="dim", width=2, no_wrap=True)
     mtable.add_column("Contact", width=30, no_wrap=True, overflow="ellipsis")
-    mtable.add_column("Message", width=msg_w, no_wrap=True, overflow="ellipsis")
+    mtable.add_column("Message", width=msg_table_w, no_wrap=True, overflow="ellipsis")
+    mtable.add_column("Thread", width=thread_w, no_wrap=True, overflow="ellipsis")
 
     for i, r in enumerate(results[:15], 1):
         sender = r.get("display_name", r.get("sender", "?"))
         phone = r.get("phone", "")
         where = _trunc(r.get("group_name", ""), 22)
         media = "\U0001f4f7 " if r.get("media_type") else ""
-        text = media + _trunc((r["text"] or r.get("media_path") or ""), msg_w - 2)
+        text = media + _trunc((r["text"] or r.get("media_path") or ""), msg_table_w - 2)
         dm = f"  DMs:{r['dm_volume']}" if r.get("dm_volume") else ""
+        thread_count = len(r.get("conversation_thread", []))
 
         contact_cell = f"{_trunc(sender, 28)}\n[cyan]{phone}[/cyan]{dm}"
         msg_cell = f"[dim]{_ts(r['time'])} {where}:[/dim]\n{text}"
-        mtable.add_row(str(i), contact_cell, msg_cell)
+        thread_cell = f"{thread_count} msgs" if thread_count else "-"
+        mtable.add_row(str(i), contact_cell, msg_cell, thread_cell)
 
     console.print(mtable)
 
