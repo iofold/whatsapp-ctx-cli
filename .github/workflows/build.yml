@@ -123,7 +123,7 @@ jobs:
         run: |
           cd dist
           for whl in *.whl; do
-            new_name=$(echo "$whl" | sed "s/py3-none-any/${{ matrix.platform }}/")
+            new_name=$(echo "$whl" | sed "s/py3-none-any/py3-none-${{ matrix.platform }}/")
             if [ "$new_name" != "$whl" ]; then
               mv "$whl" "$new_name"
             fi
