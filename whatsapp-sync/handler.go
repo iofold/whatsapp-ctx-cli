@@ -24,8 +24,8 @@ type EventHandler struct {
 	incremental   bool
 	highWatermark time.Time
 	done          chan struct{} // closed when history sync is considered complete
-	doneOnce      sync.Once   // ensures done is closed only once
-	idleTimer     *time.Timer // reset on each HistorySync event
+	doneOnce      sync.Once     // ensures done is closed only once
+	idleTimer     *time.Timer   // reset on each HistorySync event
 }
 
 // NewEventHandler constructs an EventHandler wired to the given client and
@@ -52,10 +52,10 @@ func (h *EventHandler) HandleEvent(evt interface{}) {
 		h.handleMessage(v)
 	case *events.Connected:
 		log.Println("Connected to WhatsApp")
-		// Start idle timer on connect — if no HistorySync arrives within 15s,
+		// Start idle timer on connect — if no HistorySync arrives within 30s,
 		// consider sync complete (e.g., incremental mode with no pending history).
 		if h.idleTimer == nil {
-			h.idleTimer = time.AfterFunc(15*time.Second, func() {
+			h.idleTimer = time.AfterFunc(30*time.Second, func() {
 				log.Println("sync: no history sync events received, sync considered complete")
 				h.signalDone()
 			})
@@ -115,12 +115,12 @@ func (h *EventHandler) handleHistorySync(evt *events.HistorySync) {
 
 	log.Printf("History sync: processed %d messages from %d conversations", len(records), len(conversations))
 
-	// Reset idle timer — if no more sync events in 30 seconds, we're done
+	// Reset idle timer — if no more sync events in 60 seconds, we're done
 	if h.idleTimer != nil {
 		h.idleTimer.Stop()
 	}
-	h.idleTimer = time.AfterFunc(30*time.Second, func() {
-		log.Println("sync: no new history events for 30s, sync considered complete")
+	h.idleTimer = time.AfterFunc(60*time.Second, func() {
+		log.Println("sync: no new history events for 60s, sync considered complete")
 		h.signalDone()
 	})
 }

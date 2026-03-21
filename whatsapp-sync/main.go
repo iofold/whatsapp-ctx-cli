@@ -60,7 +60,7 @@ Run "whatsapp-sync <command> --help" for command-specific flags.
 // and no session exists yet, it runs the QR login flow; otherwise it connects
 // directly with the existing session.
 func connectWhatsApp(ctx context.Context, waDBPath string, showQR bool) (*whatsmeow.Client, error) {
-	dbLog := waLog.Stdout("DB", "WARN", true)
+	dbLog := waLog.Stdout("DB", "ERROR", true)
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+waDBPath+"?_foreign_keys=on", dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sqlstore container: %w", err)
@@ -71,7 +71,7 @@ func connectWhatsApp(ctx context.Context, waDBPath string, showQR bool) (*whatsm
 		return nil, fmt.Errorf("failed to get first device: %w", err)
 	}
 
-	clientLog := waLog.Stdout("Client", "WARN", true)
+	clientLog := waLog.Stdout("Client", "ERROR", true)
 	client := whatsmeow.NewClient(device, clientLog)
 
 	if showQR && client.Store.ID == nil {
@@ -109,16 +109,26 @@ func runSyncCmd(args []string) {
 	dbPath := fs.String("db", "messages.duckdb", "path to DuckDB database file")
 	waDBPath := fs.String("wa-db", "whatsmeow.db", "path to whatsmeow SQLite session store")
 	timeout := fs.Duration("timeout", 5*time.Minute, "max time to wait for history sync")
+	historyDays := fs.Int("history-days", 1095, "days of message history to request from WhatsApp")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("Failed to parse sync flags: %v", err)
 	}
 
-	// Configure full history sync BEFORE creating the store.
-	store.DeviceProps.RequireFullSync = proto.Bool(true)
+	// Configure history sync BEFORE creating the store.
+	// RequireFullSync gets more data but takes longer. Enable for >90 days.
+	requireFull := *historyDays > 90
+	store.DeviceProps.RequireFullSync = proto.Bool(requireFull)
 	store.DeviceProps.HistorySyncConfig = &waCompanionReg.DeviceProps_HistorySyncConfig{
-		FullSyncDaysLimit:   proto.Uint32(1095),  // 3 years
-		FullSyncSizeMbLimit: proto.Uint32(10240), // 10 GB
+		FullSyncDaysLimit:   proto.Uint32(uint32(*historyDays)),
+		FullSyncSizeMbLimit: proto.Uint32(102400),
 		StorageQuotaMb:      proto.Uint32(10240),
+		SupportGroupHistory: proto.Bool(true),
+	}
+	if requireFull {
+		log.Printf("Requesting full sync (%d days of history)...", *historyDays)
+	} else {
+		store.DeviceProps.HistorySyncConfig.RecentSyncDaysLimit = proto.Uint32(uint32(*historyDays))
+		log.Printf("Requesting recent sync (%d days of history)...", *historyDays)
 	}
 
 	ctx := context.Background()
@@ -170,7 +180,9 @@ func runSyncCmd(args []string) {
 	syncContacts(client, duckStore)
 
 	messages, syncs := handler.Stats()
-	log.Printf("Stats: %d messages processed, %d history sync events", messages, syncs)
+	log.Println("────────────────────────────────────────")
+	log.Printf("Sync complete. %d messages synced across %d history batches.", messages, syncs)
+	log.Println("────────────────────────────────────────")
 
 	if *live {
 		log.Println("Live mode: listening for new messages... Press Ctrl+C to exit")
