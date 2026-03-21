@@ -604,13 +604,13 @@ def run_search(
     if ctx is not None:
         output_json = output_json or bool(ctx.params.get("output_json"))
 
+    progress: list[dict] = []
+
     queries = expand_query(client, config, query, n_variants)
-    if not output_json:
-        click.echo(f"  Expanding query into {len(queries)} variants...")
     vectors = embed_queries(client, config, queries)
     dims = config.api.embedding_dims
+    progress.append({"pass": 0, "label": f"Query → {len(queries)} variants"})
 
-    # === PASS 1: BM25 + vector candidate generation ===
     bm25_results = bm25_search(conn, query, top_k=top_k * 3)
     vector_results = semantic_search(conn, vectors, dims, top_k * 3)
 
@@ -622,29 +622,34 @@ def run_search(
             doc["rrf_score"] = doc.get("similarity", 0.0)
 
     candidates = candidates[: top_k * 3]
-    if not output_json:
-        click.echo(f"  Pass 1: {len(candidates)} candidates from BM25 + vector search")
+    progress.append(
+        {"pass": 1, "label": f"BM25 + vector → {len(candidates)} candidates"}
+    )
 
-    # === PASS 2..N: Iterative graph expansion with pruning ===
     if use_graph and n_iterations >= 2 and candidates:
         seen_seeds: set[str] = set()
         graph_passes = n_iterations - 1
 
         for i in range(graph_passes):
-            top_n = max(5, 20 - i * 3)
+            top_n = max(5, 20 - i * 2)
             seed_jids = list({c["sender_jid"] for c in candidates[:top_n]})
             new_seeds = [j for j in seed_jids if j not in seen_seeds]
             seen_seeds.update(seed_jids)
 
+            if not new_seeds and i >= 2:
+                all_jids = list({c["sender_jid"] for c in candidates[: top_n * 2]})
+                new_seeds = all_jids[: max(3, top_n // 2)]
             if not new_seeds:
                 break
 
             expanded = graph_expand_candidates(
-                conn, new_seeds, vectors, dims, top_k=max(5, top_k * 2 - i * 5)
+                conn, new_seeds, vectors, dims, top_k=max(5, top_k * 2 - i * 3)
             )
             if not expanded:
+                progress.append({"pass": i + 2, "label": "no new graph neighbours"})
                 break
 
+            prev_count = len(candidates)
             candidates = rrf_fuse(
                 [
                     (f"pass{i + 1}", candidates),
@@ -653,16 +658,18 @@ def run_search(
             )
 
             candidates = candidates[: max(top_k * 2, int(top_k * 3 * (0.85**i)))]
-            if not output_json:
-                click.echo(
-                    f"  Pass {i + 2}: expanded {len(new_seeds)} new seeds → {len(candidates)} candidates"
-                )
-
+            progress.append(
+                {
+                    "pass": i + 2,
+                    "label": f"+{len(new_seeds)} seeds → {len(candidates)} candidates",
+                }
+            )
     candidates = candidates[: top_k * 4]
 
     candidates = enrich_results(conn, candidates, config.search.owner_name, use_graph)
-    if not output_json:
-        click.echo(f"  Enriched {len(candidates)} results with graph signals")
+    progress.append(
+        {"pass": "enrich", "label": f"Enriched {len(candidates)} with graph signals"}
+    )
 
     if n_iterations >= 3:
         candidates = fetch_conversation_context(conn, candidates, limit=top_k)
@@ -677,6 +684,7 @@ def run_search(
     return {
         "query": query,
         "queries_used": queries,
+        "progress": progress,
         "depth": depth,
         "use_graph": use_graph,
         "elapsed": time.time() - t0,

@@ -26,15 +26,31 @@ def render_search_results(data: dict) -> None:
     use_graph = data["use_graph"]
     insights = data.get("insights", {})
 
-    header = Text()
-    header.append("\U0001f50d ", style="bold")
-    header.append(query, style="bold cyan")
-    header.append(
-        f"  ({len(queries_used)} queries \u00d7 {len(people)} people in {elapsed:.1f}s)"
+    progress = data.get("progress", [])
+
+    header_lines: list[str] = []
+    header_lines.append(
+        f"[bold]\U0001f50d [cyan]{query}[/cyan][/bold]"
+        f"  [dim]({len(queries_used)} queries \u00d7 {len(people)} people in {elapsed:.1f}s)[/dim]"
     )
     if queries_used[1:]:
-        header.append("\n   + " + "\n   + ".join(queries_used[1:]), style="dim")
-    console.print(Panel(header, title="Search", border_style="blue"))
+        for q in queries_used[1:]:
+            header_lines.append(f"   [dim]+ {q}[/dim]")
+
+    if progress:
+        header_lines.append("")
+        steps = []
+        for p in progress:
+            steps.append(f"[dim]{p['label']}[/dim]")
+        header_lines.append("  " + "  \u2192  ".join(steps))
+
+    console.print(
+        Panel(
+            "\n".join(header_lines),
+            title="Search",
+            border_style="blue",
+        )
+    )
 
     w = console.width or 120
 
