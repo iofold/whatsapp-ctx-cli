@@ -1,24 +1,56 @@
 # wactx
 
-Semantic + graph search over your WhatsApp messages. Built for founders with 100+ groups who need to find people, conversations, and connections fast.
+Semantic and graph search for your WhatsApp messages. All data stays local on your machine. No servers, no cloud, and no telemetry.
 
-**What it does**: Sync your WhatsApp via whatsmeow → embed with any OpenAI-compatible API → build a relationship graph → search across people, topics, and messages in one query.
+**What it does**: Sync your WhatsApp via whatsmeow, embed with any OpenAI-compatible API, build a relationship graph, and search across people, topics, and messages in one query.
+
+Everything is contained in two files:
+- `~/.config/wactx/config.toml` (configuration and session)
+- `~/.local/share/wactx/messages.duckdb` (database)
 
 ## Quickstart
 
-Requires [uv](https://docs.astral.sh/uv/) and [Go](https://go.dev/dl/) 1.21+.
+Install `wactx` immediately via pip or uv. No Go compiler or build steps are required.
 
 ```bash
-git clone https://github.com/your-org/whatsapp-ctx-cli
-cd whatsapp-ctx-cli
-uv sync
-uv run wactx init             # walks you through provider setup, builds Go binary
-uv run wactx sync             # scan QR code on first run
-uv run wactx index            # embed messages
-uv run wactx search "who knows about GTM consultants"
+pip install whatsapp-ctx-cli
+```
+or
+```bash
+uv tool install whatsapp-ctx-cli
 ```
 
-`wactx init` is interactive — it asks for your API provider, key, and builds the WhatsApp sync binary automatically. No `make` or manual config needed.
+After installation, the `wactx` command is available in your PATH.
+
+```bash
+wactx init                    # interactive setup for provider and API key
+wactx sync                    # scan QR code on first run
+wactx index                   # embed messages
+wactx search "who knows about fundraising"
+```
+
+`wactx init` walks you through setting up your API provider and key. It handles the setup automatically.
+
+## Disclaimer
+
+This tool uses whatsmeow, which is an unofficial Go library for the WhatsApp Web multi-device API.
+
+- Usage is **read-only**. This tool only reads messages and never sends or modifies anything.
+- Using unofficial WhatsApp APIs carries inherent risk. WhatsApp could restrict or ban accounts that use third-party clients.
+- The authors are not responsible for any account actions taken by WhatsApp.
+- Use this tool at your own discretion. It is best to test it on non-critical accounts first.
+
+## Data and Privacy
+
+Privacy is the core focus of this project.
+
+- **Local Storage**: All synced messages, contacts, and metadata are stored locally.
+- **Database**: Found at `~/.local/share/wactx/messages.duckdb`.
+- **Config**: Found at `~/.config/wactx/config.toml`.
+- **WhatsApp Session**: The `whatsmeow.db` session file is stored alongside your config.
+- **Removal**: To remove all data, run `wactx clean` or manually delete the files listed above.
+- **Embeddings**: Message embeddings are sent to the API provider you configure, such as OpenAI or Cloudflare.
+- **Zero Data Leak**: If you use a local Ollama instance for embeddings, no data ever leaves your machine.
 
 ## Search
 
@@ -35,37 +67,37 @@ wactx search "investors" --json | jq '.people[:5]'
 
 Search returns two ranked lists:
 
-- **People** — scored by `0.6 × semantic_similarity + 0.4 × graph_proximity` (DMs, shared groups, co-mentioned entities)
-- **Messages** — ranked by embedding cosine similarity across multiple query variants
+- **People**: Scored by semantic similarity and graph proximity. This includes DMs, shared groups, and co-mentioned entities.
+- **Messages**: Ranked by embedding cosine similarity across multiple query variants.
 
-When graph data is available, you also get a **Graph Insights** panel showing shared groups between result people, common entities, and your connection strength (🟢 strong / 🟡 weak / ⚪ indirect).
+When graph data is available, you also get a **Graph Insights** panel. This shows shared groups between people, common entities, and your connection strength (🟢 strong, 🟡 weak, or ⚪ indirect).
 
-## Sync & Media
+## Sync and Media
 
 ```bash
 wactx sync                    # incremental sync (default)
 wactx sync --full             # full history sync
-wactx sync --live             # stay connected, receive new messages
+wactx sync --live             # stay connected to receive new messages
 
 wactx download                # download all media
 wactx download --types image --after 2026-01-01
 wactx download --chat "group@g.us"
 ```
 
-First run displays a QR code in the terminal — scan it with WhatsApp on your phone. Session persists across runs.
+The first run displays a QR code in your terminal. Scan it with the WhatsApp app on your phone to connect. Your session persists across runs.
 
-## Entity Extraction & Graph
+## Entity Extraction and Graph
 
 ```bash
-wactx enrich                  # extract persons, orgs, techs, URLs, events
+wactx enrich                  # extract persons, orgs, techs, URLs, and events
 wactx graph                   # build relationship graph
 wactx search "who should I talk to about fundraising"
 ```
 
 The graph connects:
-- **People ↔ People** via DMs and group co-membership
-- **People ↔ Groups** via message activity
-- **People ↔ Entities** via extracted mentions (orgs, techs, events)
+- **People to People** via DMs and group co-membership.
+- **Group memberships** via message activity.
+- **Entity mentions** via extracted persons, organizations, technologies, and events.
 
 ## Configuration
 
@@ -92,13 +124,13 @@ default_depth = "balanced"
 owner_name = "Your Name"
 ```
 
-Works with any OpenAI-compatible endpoint:
+The tool works with any OpenAI-compatible endpoint:
 
 ```bash
 # Cloudflare AI Gateway
 wactx config api.base_url https://gateway.ai.cloudflare.com/v1/ACCOUNT/GATEWAY/compat
 
-# Ollama (local, free)
+# Ollama (local and free)
 wactx config api.base_url http://localhost:11434/v1
 wactx config api.embedding_model nomic-embed-text
 ```
@@ -114,7 +146,7 @@ wactx config api.embedding_model nomic-embed-text
 | `wactx index [--reset]` | Embed messages for semantic search |
 | `wactx enrich [--all]` | Extract entities from messages |
 | `wactx graph` | Build relationship graph |
-| `wactx search QUERY` | Semantic + graph search |
+| `wactx search QUERY` | Semantic and graph search |
 | `wactx stats` | Show database statistics |
 
 ## Agent Integration
@@ -148,16 +180,16 @@ wactx graph  ──→ DuckPGQ property graph (vertices + edges)
 wactx search ──→ multi-query semantic search + graph traversal + rich output
 ```
 
-Stack: Python · Go · DuckDB · DuckPGQ · DuckDB VSS · whatsmeow · OpenAI-compatible API · Rich · Click
+Stack: Python, Go, DuckDB, DuckPGQ, DuckDB VSS, whatsmeow, OpenAI-compatible API, Rich, and Click.
 
 ## Development
 
-Requires [uv](https://docs.astral.sh/uv/) and [Go](https://go.dev/dl/) 1.21+.
+This section is for contributors. It requires [uv](https://docs.astral.sh/uv/) and [Go](https://go.dev/dl/) 1.21+.
 
 ```bash
-git clone https://github.com/your-org/whatsapp-ctx-cli
+git clone https://github.com/iofold/whatsapp-ctx-cli
 cd whatsapp-ctx-cli
-uv sync --group dev                     # install deps + dev tools
+uv sync --group dev                     # install dependencies and dev tools
 uv run python build_go.py               # compile Go binary
 uv run pytest                           # run tests
 ```
@@ -167,7 +199,7 @@ Cross-compile for all platforms:
 uv run python build_go.py --all         # linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64
 ```
 
-A `Makefile` is included as a convenience but `uv` is all you need.
+A `Makefile` is included as a convenience, but `uv` is all you need.
 
 ## License
 
