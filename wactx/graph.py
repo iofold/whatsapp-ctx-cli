@@ -34,9 +34,14 @@ FROM contacts c WHERE is_group = true;
 
 SQL_VERTEX_TOPICS = """
 CREATE OR REPLACE TABLE graph_topics AS
-SELECT ROW_NUMBER() OVER () AS topic_id, category AS topic_name,
-       'classification' AS source, COUNT(*) AS message_count
-FROM classifications GROUP BY category HAVING COUNT(*) >= 5;
+SELECT ROW_NUMBER() OVER () AS topic_id,
+       entity_value AS topic_name,
+       entity_type AS source,
+       COUNT(*) AS message_count
+FROM extracted_entities
+WHERE entity_type IN ('tech', 'org', 'event')
+GROUP BY entity_value, entity_type
+HAVING COUNT(*) >= 3;
 """
 
 SQL_VERTEX_TOPICS_EMPTY = """
@@ -56,7 +61,7 @@ SELECT ROW_NUMBER() OVER () AS entity_id,
        COUNT(*) AS mention_count
 FROM extracted_entities
 GROUP BY entity_type, entity_value
-HAVING COUNT(*) >= 2;
+HAVING COUNT(*) >= 1;
 """
 
 SQL_EDGE_PERSON_MESSAGED = """
@@ -89,10 +94,10 @@ SQL_EDGE_PERSON_TOPIC = """
 CREATE OR REPLACE TABLE edge_person_topic AS
 SELECT ROW_NUMBER() OVER () AS edge_id, gp.person_id, gt.topic_id,
        COUNT(*) AS mention_count
-FROM messages m
-JOIN classifications cl ON m.id = cl.message_id AND m.chat_jid = cl.chat_jid
+FROM extracted_entities ee
+JOIN messages m ON ee.message_id = m.id
 JOIN graph_persons gp ON m.sender_jid = gp.source_id
-JOIN graph_topics gt ON cl.category = gt.topic_name
+JOIN graph_topics gt ON ee.entity_value = gt.topic_name AND ee.entity_type = gt.source
 GROUP BY gp.person_id, gt.topic_id;
 """
 
@@ -120,6 +125,27 @@ SELECT ROW_NUMBER() OVER () AS edge_id,
 FROM group_members a
 JOIN group_members b ON a.group_jid = b.group_jid AND a.person_id < b.person_id
 GROUP BY a.person_id, b.person_id;
+"""
+
+SQL_EDGE_PERSON_CONVERSED = """
+CREATE OR REPLACE TABLE edge_person_conversed AS
+SELECT ROW_NUMBER() OVER () AS edge_id,
+       gp1.person_id AS person1_id,
+       gp2.person_id AS person2_id,
+       m1.chat_jid AS group_jid,
+       COUNT(*) AS exchange_count,
+       MIN(m1.timestamp) AS first_exchange,
+       MAX(m1.timestamp) AS last_exchange
+FROM messages m1
+JOIN messages m2 ON m1.chat_jid = m2.chat_jid
+  AND m1.sender_jid != m2.sender_jid
+  AND m2.timestamp BETWEEN m1.timestamp AND m1.timestamp + INTERVAL '5 minutes'
+  AND m1.is_group = true
+  AND m2.is_group = true
+JOIN graph_persons gp1 ON m1.sender_jid = gp1.source_id
+JOIN graph_persons gp2 ON m2.sender_jid = gp2.source_id
+WHERE gp1.person_id < gp2.person_id
+GROUP BY gp1.person_id, gp2.person_id, m1.chat_jid;
 """
 
 SQL_EDGE_PERSON_MENTIONS_ENTITY = """
@@ -154,7 +180,7 @@ def build_vertex_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
     _run_sql(conn, "Create graph_persons", SQL_VERTEX_PERSONS_NO_EMAIL)
     _run_sql(conn, "Create graph_groups", SQL_VERTEX_GROUPS)
 
-    if table_exists(conn, "classifications"):
+    if table_exists(conn, "extracted_entities"):
         _run_sql(conn, "Create graph_topics", SQL_VERTEX_TOPICS)
     else:
         _run_sql(conn, "Create empty graph_topics", SQL_VERTEX_TOPICS_EMPTY)
@@ -175,7 +201,7 @@ def build_edge_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
     _run_sql(conn, "Create edge_person_in_group", SQL_EDGE_PERSON_IN_GROUP)
 
     if (
-        table_exists(conn, "classifications")
+        table_exists(conn, "extracted_entities")
         and _count_if_exists(conn, "graph_topics") > 0
     ):
         _run_sql(conn, "Create edge_person_topic", SQL_EDGE_PERSON_TOPIC)
@@ -183,6 +209,7 @@ def build_edge_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
         _run_sql(conn, "Create empty edge_person_topic", SQL_EDGE_PERSON_TOPIC_EMPTY)
 
     _run_sql(conn, "Create edge_person_cooccurs", SQL_EDGE_PERSON_COOCCURS)
+    _run_sql(conn, "Create edge_person_conversed", SQL_EDGE_PERSON_CONVERSED)
 
     if table_exists(conn, "extracted_entities") and table_exists(
         conn, "graph_entities"
@@ -198,6 +225,7 @@ def build_edge_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
         "edge_person_in_group": _count_if_exists(conn, "edge_person_in_group"),
         "edge_person_topic": _count_if_exists(conn, "edge_person_topic"),
         "edge_person_cooccurs": _count_if_exists(conn, "edge_person_cooccurs"),
+        "edge_person_conversed": _count_if_exists(conn, "edge_person_conversed"),
         "edge_person_mentions_entity": _count_if_exists(
             conn, "edge_person_mentions_entity"
         ),
@@ -257,7 +285,11 @@ def create_property_graph(conn: duckdb.DuckDBPyConnection) -> None:
             edge_person_cooccurs
                 SOURCE KEY (person1_id) REFERENCES graph_persons (person_id)
                 DESTINATION KEY (person2_id) REFERENCES graph_persons (person_id)
-                LABEL CoOccurs{topic_edge}{entity_edge}
+                LABEL CoOccurs,
+            edge_person_conversed
+                SOURCE KEY (person1_id) REFERENCES graph_persons (person_id)
+                DESTINATION KEY (person2_id) REFERENCES graph_persons (person_id)
+                LABEL Conversed{topic_edge}{entity_edge}
         );
     """
     conn.execute(sql)
@@ -289,6 +321,7 @@ def get_graph_stats(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
         "edge_person_in_group",
         "edge_person_topic",
         "edge_person_cooccurs",
+        "edge_person_conversed",
         "edge_person_mentions_entity",
     ]
     stats = {}
