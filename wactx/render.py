@@ -22,7 +22,6 @@ def render_search_results(data: dict) -> None:
     query = data["query"]
     queries_used = data["queries_used"]
     people = data["people"]
-    results = data["messages"]
     elapsed = data["elapsed"]
     use_graph = data["use_graph"]
     insights = data.get("insights", {})
@@ -31,129 +30,109 @@ def render_search_results(data: dict) -> None:
     header.append("\U0001f50d ", style="bold")
     header.append(query, style="bold cyan")
     header.append(
-        f"  ({len(queries_used)} queries \u00d7 {len(results)} results in {elapsed:.1f}s)"
+        f"  ({len(queries_used)} queries \u00d7 {len(people)} people in {elapsed:.1f}s)"
     )
     if queries_used[1:]:
         header.append("\n   + " + "\n   + ".join(queries_used[1:]), style="dim")
     console.print(Panel(header, title="Search", border_style="blue"))
 
     w = console.width or 120
-    msg_w = max(40, w - 42)
 
-    ptable = Table(title="\U0001f464 People", show_lines=True, width=w, pad_edge=False)
-    ptable.add_column("#", style="dim", width=2, no_wrap=True)
-    ptable.add_column("Contact", width=30, no_wrap=True, overflow="ellipsis")
-    ptable.add_column("Message", width=msg_w, no_wrap=True, overflow="ellipsis")
+    connection_map: dict[str, dict] = {}
+    for c in insights.get("connections", []):
+        connection_map[c["name"]] = c
 
     for i, p in enumerate(people[:15], 1):
-        best = p["messages"][0]
-        name = _trunc(p["display_name"], 28)
+        name = p["display_name"]
         phone = p.get("phone", "")
-        where = best.get("group_name", "")
-        ts = _ts(best["time"])
-        preview = _trunc((best["text"] or best.get("media_path") or ""), msg_w - 2)
+        score = p["score"]
+        msgs = p["messages"]
 
-        meta_parts = [
-            f"Scr:{p['score']:.2f}",
-            f"Sim:.{int(p['max_similarity'] * 1000):03d}",
-        ]
+        conn_info = connection_map.get(_trunc(name, 25), {})
+        strength = conn_info.get("strength", "")
+        indicator = {
+            "strong": "\U0001f7e2",
+            "weak": "\U0001f7e1",
+            "indirect": "\u26aa",
+        }.get(strength, "")
+
+        title_parts = [f"[bold]{name}[/bold]"]
+        if phone:
+            title_parts.append(f"[cyan]{phone}[/cyan]")
+        title_parts.append(f"[dim]Score: {score:.2f}[/dim]")
+        if indicator:
+            title_parts.append(f"{indicator} {conn_info.get('details', '')}")
+
+        title = "  ".join(title_parts)
+
+        lines: list[str] = []
+
+        graph_parts: list[str] = []
         if use_graph:
-            if p["dm_volume"]:
-                meta_parts.append(f"DMs:{p['dm_volume']}")
-            if p["shared_groups"]:
-                meta_parts.append(f"Grp:{len(p['shared_groups'])}")
-            if p["entities"]:
-                ents = ", ".join(v for _, v, _ in p["entities"][:3])
-                meta_parts.append(f"\U0001f3f7 {ents}")
-        meta_parts.append(f"Msgs:{p['message_count']}")
-
-        contact_cell = f"[bold]{name}[/bold]\n[cyan]{phone}[/cyan]  [dim]{' \u00b7 '.join(meta_parts)}[/dim]"
-        msg_cell = f"[dim]{ts} {where}:[/dim] {preview}\n"
-        if use_graph and p["shared_groups"]:
-            grps = ", ".join(_trunc(g, 22) for g in p["shared_groups"][:3])
-            msg_cell += f"[dim]  \u2514 groups: {grps}[/dim]"
-
-        ptable.add_row(str(i), contact_cell, msg_cell)
-
-    console.print(ptable)
-
-    if use_graph and insights:
-        _render_graph_insights(insights, w)
-
-    thread_w = 10
-    msg_table_w = max(30, w - 42 - thread_w)
-    mtable = Table(
-        title="\U0001f4ac Messages", show_lines=True, width=w, pad_edge=False
-    )
-    mtable.add_column("#", style="dim", width=2, no_wrap=True)
-    mtable.add_column("Contact", width=30, no_wrap=True, overflow="ellipsis")
-    mtable.add_column("Message", width=msg_table_w, no_wrap=True, overflow="ellipsis")
-    mtable.add_column("Thread", width=thread_w, no_wrap=True, overflow="ellipsis")
-
-    for i, r in enumerate(results[:15], 1):
-        sender = r.get("display_name", r.get("sender", "?"))
-        phone = r.get("phone", "")
-        where = _trunc(r.get("group_name", ""), 22)
-        media = "\U0001f4f7 " if r.get("media_type") else ""
-        text = media + _trunc((r["text"] or r.get("media_path") or ""), msg_table_w - 2)
-        dm = f"  DMs:{r['dm_volume']}" if r.get("dm_volume") else ""
-        thread_count = len(r.get("conversation_thread", []))
-
-        contact_cell = f"{_trunc(sender, 28)}\n[cyan]{phone}[/cyan]{dm}"
-        msg_cell = f"[dim]{_ts(r['time'])} {where}:[/dim]\n{text}"
-        thread_cell = f"{thread_count} msgs" if thread_count else "-"
-        mtable.add_row(str(i), contact_cell, msg_cell, thread_cell)
-
-    console.print(mtable)
-
-
-def _render_graph_insights(insights: dict, width: int) -> None:
-    lines: list[str] = []
-
-    if insights.get("relationships"):
-        lines.append("[bold]\U0001f517 Key Relationships[/bold]")
-        for rel in insights["relationships"][:6]:
-            groups_str = ""
-            if rel["groups"]:
-                groups_str = (
-                    f" in [dim]{', '.join(_trunc(g, 25) for g in rel['groups'])}[/dim]"
+            if p.get("dm_volume"):
+                graph_parts.append(f"{p['dm_volume']} DMs with you")
+            if p.get("shared_groups"):
+                grps = ", ".join(_trunc(g, 25) for g in p["shared_groups"][:3])
+                more = (
+                    f" +{len(p['shared_groups']) - 3}"
+                    if len(p["shared_groups"]) > 3
+                    else ""
                 )
-            lines.append(
-                f"  {rel['person1']} \u2194 {rel['person2']}: "
-                f"{rel['exchanges']} exchanges{groups_str}"
-            )
+                graph_parts.append(f"Groups: {grps}{more}")
+            if p.get("entities"):
+                ents = ", ".join(v for _, v, _ in p["entities"][:5])
+                graph_parts.append(f"Talks about: {ents}")
 
-    if insights.get("connections"):
-        lines.append("")
-        lines.append("[bold]\U0001f4ca Your Connections[/bold]")
-        for c in insights["connections"][:8]:
-            indicator = {
-                "strong": "\U0001f7e2",
-                "weak": "\U0001f7e1",
-                "indirect": "\u26aa",
-            }.get(c["strength"], "\u26aa")
-            lines.append(f"  {indicator} {c['name']:25s}  {c['details']}")
+        if graph_parts:
+            lines.append("[dim]" + " · ".join(graph_parts) + "[/dim]")
+            lines.append("")
 
-    if insights.get("relevant_topics"):
-        lines.append("")
-        lines.append("[bold]\U0001f3af Relevant Topics[/bold]")
-        for rt in insights["relevant_topics"][:8]:
-            who = ", ".join(f"{p}" for p in rt["people"][:4])
-            more = f" +{len(rt['people']) - 4}" if len(rt["people"]) > 4 else ""
-            lines.append(
-                f"  [on grey23] {_trunc(rt['entity'], 20)} [/]  "
-                f"({rt['total_mentions']}) \u2192 {who}{more}"
-            )
+        for j, m in enumerate(msgs[:3]):
+            where = m.get("group_name", "")
+            ts = _ts(m["time"])
+            text = m["text"] or m.get("media_path") or ""
+            media = "\U0001f4f7 " if m.get("media_type") else ""
+            preview = media + _trunc(text, w - 20)
+            lines.append(f"[dim]{ts} {_trunc(where, 30)}:[/dim]  {preview}")
 
-    if lines:
+        remaining = p["message_count"] - min(3, len(msgs))
+        if remaining > 0:
+            lines.append(f"[dim]  ... +{remaining} more messages[/dim]")
+
         console.print(
             Panel(
                 "\n".join(lines),
-                title="\U0001f9e0 Graph Insights",
-                border_style="green",
-                width=width,
+                title=f"#{i} {title}",
+                border_style="green"
+                if strength == "strong"
+                else "yellow"
+                if strength == "weak"
+                else "blue",
+                width=w,
             )
         )
+
+    topics = insights.get("relevant_topics", [])
+    if topics:
+        topic_str = "  ".join(
+            f"[on grey23] {_trunc(t['entity'], 15)} [/]({t['total_mentions']})"
+            for t in topics[:6]
+        )
+        console.print(f"\n[bold]Relevant topics:[/bold] {topic_str}")
+
+    rels = insights.get("relationships", [])
+    if rels:
+        rel_strs = []
+        for r in rels[:4]:
+            groups = (
+                f" in {', '.join(_trunc(g, 20) for g in r['groups'][:1])}"
+                if r["groups"]
+                else ""
+            )
+            rel_strs.append(
+                f"{r['person1']} \u2194 {r['person2']} ({r['exchanges']}x{groups})"
+            )
+        console.print(f"[bold]Key relationships:[/bold] " + "  \u2502  ".join(rel_strs))
 
 
 def render_stats(stats: dict) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import click
 import json
 import logging
 import time
@@ -588,6 +589,7 @@ def run_search(
     top: int | None = None,
     no_graph: bool = False,
     iterations: int | None = None,
+    output_json: bool = False,
 ) -> dict:
     preset = DEPTH_PRESETS.get(depth, DEPTH_PRESETS["balanced"])
     n_variants = variants if variants is not None else preset["variants"]
@@ -598,7 +600,13 @@ def run_search(
     client = OpenAI(base_url=config.api.base_url, api_key=config.api.key)
     t0 = time.time()
 
+    ctx = click.get_current_context(silent=True)
+    if ctx is not None:
+        output_json = output_json or bool(ctx.params.get("output_json"))
+
     queries = expand_query(client, config, query, n_variants)
+    if not output_json:
+        click.echo(f"  Expanding query into {len(queries)} variants...")
     vectors = embed_queries(client, config, queries)
     dims = config.api.embedding_dims
 
@@ -614,6 +622,8 @@ def run_search(
             doc["rrf_score"] = doc.get("similarity", 0.0)
 
     candidates = candidates[: top_k * 3]
+    if not output_json:
+        click.echo(f"  Pass 1: {len(candidates)} candidates from BM25 + vector search")
 
     # === PASS 2..N: Iterative graph expansion with pruning ===
     if use_graph and n_iterations >= 2 and candidates:
@@ -643,10 +653,16 @@ def run_search(
             )
 
             candidates = candidates[: max(top_k * 2, int(top_k * 3 * (0.85**i)))]
+            if not output_json:
+                click.echo(
+                    f"  Pass {i + 2}: expanded {len(new_seeds)} new seeds → {len(candidates)} candidates"
+                )
 
     candidates = candidates[: top_k * 4]
 
     candidates = enrich_results(conn, candidates, config.search.owner_name, use_graph)
+    if not output_json:
+        click.echo(f"  Enriched {len(candidates)} results with graph signals")
 
     if n_iterations >= 3:
         candidates = fetch_conversation_context(conn, candidates, limit=top_k)
