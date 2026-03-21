@@ -101,17 +101,66 @@ async def embed_texts(
 
     log.info("Embedding %d messages...", remaining)
     rows = conn.execute(
-        "SELECT id, text_content FROM messages "
-        "WHERE embedding IS NULL AND text_content IS NOT NULL AND TRIM(text_content) != '' "
-        "ORDER BY id"
+        """
+        SELECT
+            m.id,
+            m.text_content,
+            m.chat_jid,
+            m.timestamp,
+            (SELECT STRING_AGG(m2.push_name || ': ' || m2.text_content, chr(10)
+                ORDER BY m2.timestamp ASC)
+             FROM (
+                SELECT push_name, text_content, timestamp
+                FROM messages m2
+                WHERE m2.chat_jid = m.chat_jid
+                  AND m2.timestamp < m.timestamp
+                  AND m2.timestamp >= m.timestamp - INTERVAL '30 minutes'
+                  AND m2.text_content IS NOT NULL
+                  AND TRIM(m2.text_content) != ''
+                ORDER BY m2.timestamp DESC
+                LIMIT 1
+             ) m2
+            ) AS context_before,
+            (SELECT STRING_AGG(m2.push_name || ': ' || m2.text_content, chr(10)
+                ORDER BY m2.timestamp ASC)
+             FROM (
+                SELECT push_name, text_content, timestamp
+                FROM messages m2
+                WHERE m2.chat_jid = m.chat_jid
+                  AND m2.timestamp > m.timestamp
+                  AND m2.timestamp <= m.timestamp + INTERVAL '30 minutes'
+                  AND m2.text_content IS NOT NULL
+                  AND TRIM(m2.text_content) != ''
+                ORDER BY m2.timestamp ASC
+                LIMIT 1
+             ) m2
+            ) AS context_after
+        FROM messages m
+        WHERE m.embedding IS NULL
+          AND m.text_content IS NOT NULL
+          AND TRIM(m.text_content) != ''
+        ORDER BY m.id
+        """
     ).fetchall()
 
     clean_rows: list[tuple[str, str]] = []
-    for msg_id, text_content in rows:
-        cleaned = (text_content or "").strip()
-        if not cleaned:
+    for row in rows:
+        msg_id = row[0]
+        text_content = (row[1] or "").strip()
+        if not text_content:
             continue
-        clean_rows.append((msg_id, cleaned[:MAX_TEXT_CHARS]))
+        context_before = (row[4] or "").strip() if len(row) > 4 else ""
+        context_after = (row[5] or "").strip() if len(row) > 5 else ""
+
+        parts = []
+        if context_before:
+            parts.append(context_before)
+        parts.append(text_content)
+        if context_after:
+            parts.append(context_after)
+
+        embed_text = "\n---\n".join(parts)
+        clean_rows.append((msg_id, embed_text[:MAX_TEXT_CHARS]))
 
     batches: list[tuple[list[str], list[str]]] = []
     for i in range(0, len(clean_rows), BATCH_SIZE):
@@ -120,7 +169,9 @@ async def embed_texts(
         texts = [row[1] for row in chunk]
         batches.append((ids, texts))
 
-    client = AsyncOpenAI(base_url=config.api.base_url, api_key=config.api.key)
+    client = AsyncOpenAI(
+        base_url=config.api.base_url, api_key=config.api.key, timeout=60.0
+    )
     sem = asyncio.Semaphore(max(1, int(config.api.max_concurrent)))
 
     embedded = 0
