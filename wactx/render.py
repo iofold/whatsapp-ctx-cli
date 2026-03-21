@@ -110,32 +110,40 @@ def render_search_results(data: dict) -> None:
 def _render_graph_insights(insights: dict, width: int) -> None:
     lines: list[str] = []
 
-    if insights.get("shared_groups"):
-        lines.append("[bold]\U0001f517 Shared Groups Between Results[/bold]")
-        for sg in insights["shared_groups"][:8]:
-            grps = ", ".join(_trunc(g, 25) for g in sg["groups"][:3])
-            more = f" +{len(sg['groups']) - 3}" if len(sg["groups"]) > 3 else ""
+    if insights.get("relationships"):
+        lines.append("[bold]\U0001f517 Key Relationships[/bold]")
+        for rel in insights["relationships"][:6]:
+            groups_str = ""
+            if rel["groups"]:
+                groups_str = (
+                    f" in [dim]{', '.join(_trunc(g, 25) for g in rel['groups'])}[/dim]"
+                )
             lines.append(
-                f"  {sg['person1']} \u2194 {sg['person2']}  via [dim]{grps}{more}[/dim]"
+                f"  {rel['person1']} \u2194 {rel['person2']}: "
+                f"{rel['exchanges']} exchanges{groups_str}"
             )
-
-    if insights.get("common_entities"):
-        lines.append("")
-        lines.append("[bold]\U0001f3f7  Common Entities Across Results[/bold]")
-        for ce in insights["common_entities"][:6]:
-            who = ", ".join(ce["people"][:4])
-            lines.append(f"  [on grey23] {ce['entity']} [/]  mentioned by {who}")
 
     if insights.get("connections"):
         lines.append("")
-        lines.append("[bold]\U0001f4ca Your Connection to Results[/bold]")
-        for c in insights["connections"]:
+        lines.append("[bold]\U0001f4ca Your Connections[/bold]")
+        for c in insights["connections"][:8]:
             indicator = {
                 "strong": "\U0001f7e2",
                 "weak": "\U0001f7e1",
                 "indirect": "\u26aa",
             }.get(c["strength"], "\u26aa")
-            lines.append(f"  {indicator} {c['name']:20s}  {c['details']}")
+            lines.append(f"  {indicator} {c['name']:25s}  {c['details']}")
+
+    if insights.get("relevant_topics"):
+        lines.append("")
+        lines.append("[bold]\U0001f3af Relevant Topics[/bold]")
+        for rt in insights["relevant_topics"][:8]:
+            who = ", ".join(f"{p}" for p in rt["people"][:4])
+            more = f" +{len(rt['people']) - 4}" if len(rt["people"]) > 4 else ""
+            lines.append(
+                f"  [on grey23] {_trunc(rt['entity'], 20)} [/]  "
+                f"({rt['total_mentions']}) \u2192 {who}{more}"
+            )
 
     if lines:
         console.print(

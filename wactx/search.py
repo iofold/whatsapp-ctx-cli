@@ -178,29 +178,50 @@ def graph_expand_candidates(
                 SELECT CASE
                     WHEN epm.sender_person_id IN (SELECT person_id FROM seed)
                     THEN epm.receiver_person_id ELSE epm.sender_person_id
-                END AS person_id, epm.message_count AS weight
+                END AS person_id, epm.message_count * 3.0 AS weight
                 FROM edge_person_messaged epm
                 WHERE epm.sender_person_id IN (SELECT person_id FROM seed)
                    OR epm.receiver_person_id IN (SELECT person_id FROM seed)
             ),
             via_group AS (
-                SELECT e2.person_id, e2.message_count AS weight
+                SELECT e2.person_id, e2.message_count * 1.0 AS weight
                 FROM edge_person_in_group e1
                 JOIN edge_person_in_group e2 ON e1.group_jid = e2.group_jid
                 WHERE e1.person_id IN (SELECT person_id FROM seed)
                   AND e2.person_id NOT IN (SELECT person_id FROM seed)
             ),
+            via_conversation AS (
+                SELECT CASE
+                    WHEN epc.person1_id IN (SELECT person_id FROM seed)
+                    THEN epc.person2_id ELSE epc.person1_id
+                END AS person_id, epc.exchange_count * 5.0 AS weight
+                FROM edge_person_conversed epc
+                WHERE epc.person1_id IN (SELECT person_id FROM seed)
+                   OR epc.person2_id IN (SELECT person_id FROM seed)
+            ),
+            via_entity AS (
+                SELECT e2.person_id, e2.mention_count * 2.0 AS weight
+                FROM edge_person_mentions_entity e1
+                JOIN edge_person_mentions_entity e2 ON e1.entity_id = e2.entity_id
+                WHERE e1.person_id IN (SELECT person_id FROM seed)
+                  AND e2.person_id NOT IN (SELECT person_id FROM seed)
+            ),
             all_neighbours AS (
                 SELECT person_id, SUM(weight) AS total_weight
-                FROM (SELECT * FROM via_dm UNION ALL SELECT * FROM via_group) combined
+                FROM (
+                    SELECT * FROM via_dm
+                    UNION ALL SELECT * FROM via_group
+                    UNION ALL SELECT * FROM via_conversation
+                    UNION ALL SELECT * FROM via_entity
+                ) combined
                 WHERE person_id NOT IN (SELECT person_id FROM seed)
                 GROUP BY person_id
             )
-            SELECT gp.source_id
+            SELECT gp.source_id, an.total_weight
             FROM all_neighbours an
             JOIN graph_persons gp ON an.person_id = gp.person_id
             ORDER BY an.total_weight DESC
-            LIMIT 20
+            LIMIT 30
             """,
             seed_jids,
         ).fetchall()
@@ -211,6 +232,7 @@ def graph_expand_candidates(
         return []
 
     neighbour_jids = [r[0] for r in neighbour_rows]
+    neighbour_weights = {r[0]: r[1] for r in neighbour_rows}
     n_placeholders = ", ".join(["?"] * len(neighbour_jids))
 
     expanded = []
@@ -230,6 +252,7 @@ def graph_expand_candidates(
             continue
 
         for r in rows:
+            graph_weight = neighbour_weights.get(r[3], 1.0)
             expanded.append(
                 {
                     "id": r[0],
@@ -240,13 +263,13 @@ def graph_expand_candidates(
                     "time": r[5],
                     "media_type": r[6],
                     "media_path": r[7],
-                    "similarity": float(r[8]),
+                    "similarity": float(r[8]) * min(2.0, 1.0 + graph_weight / 100.0),
                 }
             )
 
     seen = set()
     unique = []
-    for doc in expanded:
+    for doc in sorted(expanded, key=lambda x: x["similarity"], reverse=True):
         if doc["id"] not in seen:
             seen.add(doc["id"])
             unique.append(doc)
@@ -411,49 +434,86 @@ def find_related_people(results: list[dict]) -> list[dict]:
 def compute_graph_insights(
     conn: duckdb.DuckDBPyConnection, people: list[dict], owner_name: str
 ) -> dict:
-    insights: dict = {"shared_groups": [], "common_entities": [], "connections": []}
-    names = {p["sender_jid"]: p["display_name"][:20] for p in people}
+    insights: dict = {
+        "relationships": [],
+        "connections": [],
+        "relevant_topics": [],
+    }
+    if not people:
+        return insights
 
-    for i, p1 in enumerate(people):
-        for p2 in people[i + 1 :]:
-            shared = set(p1.get("shared_groups", [])) & set(p2.get("shared_groups", []))
-            if shared:
-                insights["shared_groups"].append(
-                    {
-                        "person1": names.get(p1["sender_jid"], "?"),
-                        "person2": names.get(p2["sender_jid"], "?"),
-                        "groups": sorted(shared),
-                    }
-                )
+    names = {p["sender_jid"]: p["display_name"][:25] for p in people}
+    jids = [p["sender_jid"] for p in people[:15]]
 
-    entity_people: dict[str, list[str]] = {}
-    for p in people:
-        for _, val, _ in p.get("entities", []):
-            entity_people.setdefault(val, []).append(names.get(p["sender_jid"], "?"))
-    insights["common_entities"] = [
-        {"entity": e, "people": ppl}
-        for e, ppl in sorted(entity_people.items(), key=lambda x: -len(x[1]))
-        if len(ppl) >= 2
-    ][:6]
+    if not jids:
+        return insights
+
+    placeholders = ", ".join(["?"] * len(jids))
+
+    try:
+        rels = conn.execute(
+            f"""
+            SELECT gp1.display_name, gp2.display_name,
+                   SUM(epc.exchange_count) AS exchanges,
+                   LIST(DISTINCT gg.group_name) AS groups
+            FROM edge_person_conversed epc
+            JOIN graph_persons gp1 ON epc.person1_id = gp1.person_id
+            JOIN graph_persons gp2 ON epc.person2_id = gp2.person_id
+            LEFT JOIN graph_groups gg ON epc.group_jid = gg.group_jid
+            WHERE gp1.source_id IN ({placeholders})
+              AND gp2.source_id IN ({placeholders})
+            GROUP BY gp1.display_name, gp2.display_name
+            ORDER BY exchanges DESC
+            LIMIT 6
+        """,
+            jids + jids,
+        ).fetchall()
+
+        for r in rels:
+            groups = [g for g in (r[3] or []) if g][:2]
+            insights["relationships"].append(
+                {
+                    "person1": r[0][:25],
+                    "person2": r[1][:25],
+                    "exchanges": r[2],
+                    "groups": groups,
+                }
+            )
+    except Exception:
+        pass
 
     for p in people[:10]:
         if p["display_name"] in ("Self", "?"):
             continue
         parts = []
-        if p.get("dm_volume"):
-            parts.append(f"{p['dm_volume']} DMs")
-        n_grp = len(p.get("shared_groups", []))
-        if n_grp:
-            top = ", ".join(g[:20] for g in p["shared_groups"][:2])
-            parts.append(f"{n_grp} groups ({top})")
+        dm_vol = p.get("dm_volume", 0)
+        if dm_vol:
+            parts.append(f"{dm_vol} DMs")
+        shared = p.get("shared_groups", [])
+        if shared:
+            top = ", ".join(g[:25] for g in shared[:2])
+            more = f" +{len(shared) - 2}" if len(shared) > 2 else ""
+            parts.append(f"{len(shared)} groups ({top}{more})")
+
+        try:
+            conv = conn.execute(
+                """
+                SELECT SUM(exchange_count)
+                FROM edge_person_conversed epc
+                JOIN graph_persons gp1 ON epc.person1_id = gp1.person_id
+                JOIN graph_persons gp2 ON epc.person2_id = gp2.person_id
+                WHERE (gp1.source_id = ? AND gp2.display_name = ?)
+                   OR (gp2.source_id = ? AND gp1.display_name = ?)
+            """,
+                [p["sender_jid"], owner_name, p["sender_jid"], owner_name],
+            ).fetchone()
+            if conv and conv[0]:
+                parts.append(f"{conv[0]} group exchanges")
+        except Exception:
+            pass
+
         if parts:
-            strength = (
-                "strong"
-                if p.get("dm_volume", 0) > 10
-                else "weak"
-                if p.get("dm_volume", 0) > 0
-                else "indirect"
-            )
+            strength = "strong" if dm_vol > 10 else "weak" if dm_vol > 0 else "indirect"
             insights["connections"].append(
                 {
                     "name": names.get(p["sender_jid"], "?"),
@@ -461,6 +521,60 @@ def compute_graph_insights(
                     "details": " · ".join(parts),
                 }
             )
+
+    GENERIC_ENTITIES = {
+        "AI",
+        "India",
+        "US",
+        "USA",
+        "UK",
+        "Google",
+        "the",
+        "The",
+        "a",
+        "an",
+        "San Francisco",
+        "New York",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+        "today",
+        "tomorrow",
+        "yesterday",
+    }
+
+    entity_people: dict[str, list[str]] = {}
+    entity_counts: dict[str, int] = {}
+    for p in people:
+        for _, val, count in p.get("entities", []):
+            if val in GENERIC_ENTITIES or len(val) < 3:
+                continue
+            entity_people.setdefault(val, []).append(names.get(p["sender_jid"], "?"))
+            entity_counts[val] = entity_counts.get(val, 0) + (count or 1)
+
+    insights["relevant_topics"] = [
+        {"entity": e, "people": ppl, "total_mentions": entity_counts.get(e, 0)}
+        for e, ppl in sorted(
+            entity_people.items(), key=lambda x: -entity_counts.get(x[0], 0)
+        )
+        if len(ppl) >= 2
+    ][:8]
 
     return insights
 
@@ -485,11 +599,10 @@ def run_search(
 
     queries = expand_query(client, config, query, n_variants)
     vectors = embed_queries(client, config, queries)
+    dims = config.api.embedding_dims
 
     bm25_results = bm25_search(conn, query, top_k=top_k * 3)
-    vector_results = semantic_search(
-        conn, vectors, config.api.embedding_dims, top_k * 3
-    )
+    vector_results = semantic_search(conn, vectors, dims, top_k * 3)
 
     if bm25_results:
         candidates = rrf_fuse([("bm25", bm25_results), ("vector", vector_results)])
@@ -498,16 +611,39 @@ def run_search(
         for doc in candidates:
             doc["rrf_score"] = doc.get("similarity", 0.0)
 
-    if use_graph and iterations >= 2 and len(candidates) > 0:
-        seed_jids = list({c["sender_jid"] for c in candidates[:20]})
-        expanded = graph_expand_candidates(
-            conn, seed_jids, vectors, config.api.embedding_dims, top_k=top_k
+    candidates = candidates[: top_k * 3]
+
+    if use_graph and iterations >= 2 and candidates:
+        seed_jids_pass1 = list({c["sender_jid"] for c in candidates[:20]})
+        expanded_pass1 = graph_expand_candidates(
+            conn, seed_jids_pass1, vectors, dims, top_k=top_k * 2
         )
-        if expanded:
-            all_rankings = [("iteration1", candidates), ("graph_expanded", expanded)]
-            candidates = rrf_fuse(all_rankings)
+        if expanded_pass1:
+            candidates = rrf_fuse(
+                [
+                    ("pass1", candidates),
+                    ("graph_pass1", expanded_pass1),
+                ]
+            )
+
+        candidates = candidates[: top_k * 2]
+
+        seed_jids_pass2 = list({c["sender_jid"] for c in candidates[:15]})
+        new_seeds = [j for j in seed_jids_pass2 if j not in seed_jids_pass1]
+        if new_seeds:
+            expanded_pass2 = graph_expand_candidates(
+                conn, new_seeds, vectors, dims, top_k=top_k
+            )
+            if expanded_pass2:
+                candidates = rrf_fuse(
+                    [
+                        ("merged", candidates),
+                        ("graph_pass2", expanded_pass2),
+                    ]
+                )
 
     candidates = candidates[: top_k * 4]
+
     candidates = enrich_results(conn, candidates, config.search.owner_name, use_graph)
 
     if iterations >= 3:
