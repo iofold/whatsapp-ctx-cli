@@ -111,11 +111,11 @@ jobs:
           ls -la
 
       - name: Build wheel
+        shell: bash
         run: |
-          pip install build setuptools wheel
-          python -m build --wheel
-        env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ github.ref_name }}
+          pip install build setuptools setuptools-scm wheel
+          VERSION="${GITHUB_REF_NAME#v}"
+          SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION" python -m build --wheel
 
       - name: Rename wheel for platform
         shell: bash

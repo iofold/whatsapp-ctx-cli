@@ -1,4 +1,4 @@
-.PHONY: build install dev test clean build-all sync
+.PHONY: build install dev test clean build-all sync dist dist-clean check
 
 build:
 	uv run python build_go.py
@@ -18,6 +18,15 @@ clean:
 
 build-all:
 	uv run python build_go.py --all
+
+dist: build-all
+	uv run python -m build --wheel
+
+dist-clean:
+	rm -rf build/ dist/ *.egg-info whatsapp_ctx_cli.egg-info
+
+check:
+	uv run twine check dist/*
 
 sync:
 	uv run wactx sync

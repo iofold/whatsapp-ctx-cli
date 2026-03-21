@@ -1,4 +1,9 @@
-"""Build the whatsapp-sync Go binary for the current platform or cross-compile for distribution."""
+"""Build the whatsapp-sync Go binary for the current platform or cross-compile for distribution.
+
+Cross-compilation note: go-duckdb requires CGO. Local --all only succeeds for
+targets where a C cross-compiler is available. The CI workflow builds natively
+on each platform (ubuntu/macos/windows runners) to avoid this limitation.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +26,10 @@ TARGETS = [
     ("windows", "amd64"),
 ]
 
+_CROSS_CC: dict[tuple[str, str], str] = {
+    ("linux", "arm64"): "aarch64-linux-gnu-gcc",
+}
+
 
 def _binary_name(goos: str, goarch: str) -> str:
     name = f"whatsapp-sync-{goos}-{goarch}"
@@ -29,7 +38,7 @@ def _binary_name(goos: str, goarch: str) -> str:
     return name
 
 
-def _current_platform_binary() -> str:
+def _host_target() -> tuple[str, str]:
     goos = {"Linux": "linux", "Darwin": "darwin", "Windows": "windows"}.get(
         platform.system(), "linux"
     )
@@ -39,7 +48,15 @@ def _current_platform_binary() -> str:
         "aarch64": "arm64",
         "arm64": "arm64",
     }.get(platform.machine(), "amd64")
-    return _binary_name(goos, goarch)
+    return goos, goarch
+
+
+def _current_platform_binary() -> str:
+    return _binary_name(*_host_target())
+
+
+def _is_native(goos: str, goarch: str) -> bool:
+    return (goos, goarch) == _host_target()
 
 
 def build_current() -> Path:
@@ -84,15 +101,38 @@ def build_all() -> list[Path]:
         print("ERROR: Go compiler not found.", file=sys.stderr)
         sys.exit(1)
 
-    built = []
+    built: list[Path] = []
+    skipped: list[str] = []
+
     for goos, goarch in TARGETS:
         name = _binary_name(goos, goarch)
         output = BIN_DIR / name
-        print(f"Cross-compiling for {goos}/{goarch}...")
+        native = _is_native(goos, goarch)
 
-        cgo = "0"
-        env = {**os.environ, "GOOS": goos, "GOARCH": goarch, "CGO_ENABLED": cgo}
+        env = {**os.environ, "GOOS": goos, "GOARCH": goarch}
 
+        if native:
+            env["CGO_ENABLED"] = "1"
+            label = "native"
+        elif (goos, goarch) in _CROSS_CC:
+            cc = _CROSS_CC[(goos, goarch)]
+            if not shutil.which(cc):
+                skipped.append(
+                    f"  SKIP: {goos}/{goarch} — cross-compiler '{cc}' not found "
+                    f"(install with: sudo apt-get install gcc-aarch64-linux-gnu)"
+                )
+                continue
+            env["CGO_ENABLED"] = "1"
+            env["CC"] = cc
+            label = f"cross (CC={cc})"
+        else:
+            skipped.append(
+                f"  SKIP: {goos}/{goarch} — no C cross-compiler available "
+                f"(go-duckdb requires CGO; use CI for this target)"
+            )
+            continue
+
+        print(f"Building for {goos}/{goarch} [{label}]...")
         try:
             subprocess.run(
                 [go_bin, "build", "-o", str(output), "."],
@@ -105,6 +145,18 @@ def build_all() -> list[Path]:
             print(f"  Built: {name} ({output.stat().st_size / 1024 / 1024:.1f} MB)")
         except subprocess.CalledProcessError as e:
             print(f"  FAILED: {goos}/{goarch}: {e}", file=sys.stderr)
+
+    if skipped:
+        print(
+            f"\n{len(skipped)} target(s) skipped (CGO cross-compilation not available):"
+        )
+        for msg in skipped:
+            print(msg, file=sys.stderr)
+        print(
+            "\nNote: The CI workflow builds all platforms natively. "
+            "Push a v* tag to trigger a full build.",
+            file=sys.stderr,
+        )
 
     return built
 
