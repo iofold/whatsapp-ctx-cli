@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import logging
 import time
 
@@ -304,6 +305,18 @@ def build_graph(conn: duckdb.DuckDBPyConnection, config: Config) -> dict:
     stats.update(build_vertex_tables(conn))
     stats.update(build_edge_tables(conn))
     create_property_graph(conn)
+
+    try:
+        graph_search = importlib.import_module("wactx.graph_search")
+
+        graph_search.clear_graph_cache()
+        communities = graph_search.leiden_communities(conn)
+        if communities:
+            summaries = graph_search.store_communities(conn, communities)
+            stats["communities"] = len(summaries)
+    except Exception as e:
+        log.warning("Leiden community detection skipped: %s", e)
+
     stats.update(get_graph_stats(conn))
 
     elapsed = time.time() - t0
@@ -332,4 +345,14 @@ def get_graph_stats(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
                 stats[t] = 0
             else:
                 stats[t] = int(row[0])
+
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT community_id) FROM graph_persons WHERE community_id >= 0"
+        ).fetchone()
+        if row:
+            stats["communities"] = int(row[0])
+    except Exception:
+        pass
+
     return stats
