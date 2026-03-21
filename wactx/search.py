@@ -252,7 +252,7 @@ def graph_expand_candidates(
             continue
 
         for r in rows:
-            graph_weight = neighbour_weights.get(r[3], 1.0)
+            graph_weight = float(neighbour_weights.get(r[3], 1.0))
             expanded.append(
                 {
                     "id": r[0],
