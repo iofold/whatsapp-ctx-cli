@@ -155,128 +155,6 @@ def rrf_fuse(rankings: list[tuple[str, list[dict]]], k: int = 60) -> list[dict]:
     return fused
 
 
-def graph_expand_candidates(
-    conn: duckdb.DuckDBPyConnection,
-    seed_jids: list[str],
-    vectors: list[list[float]],
-    dims: int,
-    top_k: int = 20,
-) -> list[dict]:
-    from wactx.db import table_exists
-
-    if not table_exists(conn, "graph_persons") or not seed_jids:
-        return []
-
-    placeholders = ", ".join(["?"] * len(seed_jids))
-
-    try:
-        neighbour_rows = conn.execute(
-            f"""
-            WITH seed AS (
-                SELECT person_id FROM graph_persons WHERE source_id IN ({placeholders})
-            ),
-            via_dm AS (
-                SELECT CASE
-                    WHEN epm.sender_person_id IN (SELECT person_id FROM seed)
-                    THEN epm.receiver_person_id ELSE epm.sender_person_id
-                END AS person_id, epm.message_count * 3.0 AS weight
-                FROM edge_person_messaged epm
-                WHERE epm.sender_person_id IN (SELECT person_id FROM seed)
-                   OR epm.receiver_person_id IN (SELECT person_id FROM seed)
-            ),
-            via_group AS (
-                SELECT e2.person_id, e2.message_count * 1.0 AS weight
-                FROM edge_person_in_group e1
-                JOIN edge_person_in_group e2 ON e1.group_jid = e2.group_jid
-                WHERE e1.person_id IN (SELECT person_id FROM seed)
-                  AND e2.person_id NOT IN (SELECT person_id FROM seed)
-            ),
-            via_conversation AS (
-                SELECT CASE
-                    WHEN epc.person1_id IN (SELECT person_id FROM seed)
-                    THEN epc.person2_id ELSE epc.person1_id
-                END AS person_id, epc.exchange_count * 5.0 AS weight
-                FROM edge_person_conversed epc
-                WHERE epc.person1_id IN (SELECT person_id FROM seed)
-                   OR epc.person2_id IN (SELECT person_id FROM seed)
-            ),
-            via_entity AS (
-                SELECT e2.person_id, e2.mention_count * 2.0 AS weight
-                FROM edge_person_mentions_entity e1
-                JOIN edge_person_mentions_entity e2 ON e1.entity_id = e2.entity_id
-                WHERE e1.person_id IN (SELECT person_id FROM seed)
-                  AND e2.person_id NOT IN (SELECT person_id FROM seed)
-            ),
-            all_neighbours AS (
-                SELECT person_id, SUM(weight) AS total_weight
-                FROM (
-                    SELECT * FROM via_dm
-                    UNION ALL SELECT * FROM via_group
-                    UNION ALL SELECT * FROM via_conversation
-                    UNION ALL SELECT * FROM via_entity
-                ) combined
-                WHERE person_id NOT IN (SELECT person_id FROM seed)
-                GROUP BY person_id
-            )
-            SELECT gp.source_id, an.total_weight
-            FROM all_neighbours an
-            JOIN graph_persons gp ON an.person_id = gp.person_id
-            ORDER BY an.total_weight DESC
-            LIMIT 30
-            """,
-            seed_jids,
-        ).fetchall()
-    except Exception:
-        return []
-
-    if not neighbour_rows:
-        return []
-
-    neighbour_jids = [r[0] for r in neighbour_rows]
-    neighbour_weights = {r[0]: r[1] for r in neighbour_rows}
-    n_placeholders = ", ".join(["?"] * len(neighbour_jids))
-
-    expanded = []
-    for qvec in vectors[:2]:
-        try:
-            rows = conn.execute(
-                f"""SELECT id, text_content, push_name, sender_jid, chat_jid, timestamp,
-                           media_type, media_path,
-                           array_cosine_similarity(embedding, ?::FLOAT[{dims}]) AS similarity
-                    FROM messages
-                    WHERE embedding IS NOT NULL
-                      AND sender_jid IN ({n_placeholders})
-                    ORDER BY similarity DESC LIMIT ?""",
-                [qvec] + neighbour_jids + [top_k],
-            ).fetchall()
-        except Exception:
-            continue
-
-        for r in rows:
-            graph_weight = float(neighbour_weights.get(r[3], 1.0))
-            expanded.append(
-                {
-                    "id": r[0],
-                    "text": r[1],
-                    "sender": r[2],
-                    "sender_jid": r[3],
-                    "chat_jid": r[4],
-                    "time": r[5],
-                    "media_type": r[6],
-                    "media_path": r[7],
-                    "similarity": float(r[8]) * min(2.0, 1.0 + graph_weight / 100.0),
-                }
-            )
-
-    seen = set()
-    unique = []
-    for doc in sorted(expanded, key=lambda x: x["similarity"], reverse=True):
-        if doc["id"] not in seen:
-            seen.add(doc["id"])
-            unique.append(doc)
-    return unique
-
-
 def enrich_results(
     conn: duckdb.DuckDBPyConnection,
     results: list[dict],
@@ -395,6 +273,7 @@ def find_related_people(results: list[dict]) -> list[dict]:
                 "sender_jid": jid,
                 "max_similarity": r.get("similarity", 0.0),
                 "max_rrf": r.get("rrf_score", 0.0),
+                "max_ppr": r.get("ppr_score", 0.0),
                 "message_count": 0,
                 "dm_volume": r.get("dm_volume", 0),
                 "shared_groups": r.get("shared_groups", []),
@@ -406,6 +285,7 @@ def find_related_people(results: list[dict]) -> list[dict]:
         p["message_count"] += 1
         p["max_similarity"] = max(p["max_similarity"], r.get("similarity", 0.0))
         p["max_rrf"] = max(p["max_rrf"], r.get("rrf_score", 0.0))
+        p["max_ppr"] = max(p["max_ppr"], r.get("ppr_score", 0.0))
         p["conversation_boost"] = max(
             p["conversation_boost"], r.get("conversation_boost", 0.0)
         )
@@ -419,15 +299,20 @@ def find_related_people(results: list[dict]) -> list[dict]:
 
     for p in by_person.values():
         retrieval = max(p["max_rrf"] * 100, p["max_similarity"])
+
+        ppr = p.get("max_ppr", 0) * 1000
+
         graph = min(
             1.0,
-            (0.3 if p["dm_volume"] > 0 else 0)
+            (0.3 if p.get("dm_volume", 0) > 0 else 0)
             + 0.1 * min(3, len(p["shared_groups"]))
             + 0.1 * min(3, p["message_count"])
             + 0.05 * min(3, len(p["entities"])),
         )
+
         conv = p["conversation_boost"]
-        p["score"] = 0.50 * retrieval + 0.30 * graph + 0.20 * conv
+
+        p["score"] = 0.35 * retrieval + 0.35 * ppr + 0.15 * graph + 0.15 * conv
 
     return sorted(by_person.values(), key=lambda x: x["score"], reverse=True)
 
@@ -591,26 +476,29 @@ def run_search(
     iterations: int | None = None,
     output_json: bool = False,
 ) -> dict:
+    import click
+
     preset = DEPTH_PRESETS.get(depth, DEPTH_PRESETS["balanced"])
     n_variants = variants if variants is not None else preset["variants"]
     top_k = top if top is not None else preset["top"]
     use_graph = preset["graph"] and not no_graph
     n_iterations = iterations if iterations is not None else preset.get("iterations", 1)
 
-    client = OpenAI(base_url=config.api.base_url, api_key=config.api.key)
-    t0 = time.time()
-
     ctx = click.get_current_context(silent=True)
     if ctx is not None:
         output_json = output_json or bool(ctx.params.get("output_json"))
 
+    client = OpenAI(base_url=config.api.base_url, api_key=config.api.key)
+    t0 = time.time()
     progress: list[dict] = []
 
+    # Phase 1: Query expansion + embedding
     queries = expand_query(client, config, query, n_variants)
     vectors = embed_queries(client, config, queries)
     dims = config.api.embedding_dims
-    progress.append({"pass": 0, "label": f"Query → {len(queries)} variants"})
+    progress.append({"label": f"Query → {len(queries)} variants"})
 
+    # Phase 2: BM25 + vector candidate generation
     bm25_results = bm25_search(conn, query, top_k=top_k * 3)
     vector_results = semantic_search(conn, vectors, dims, top_k * 3)
 
@@ -622,57 +510,305 @@ def run_search(
             doc["rrf_score"] = doc.get("similarity", 0.0)
 
     candidates = candidates[: top_k * 3]
-    progress.append(
-        {"pass": 1, "label": f"BM25 + vector → {len(candidates)} candidates"}
-    )
+    progress.append({"label": f"BM25 + vector → {len(candidates)} candidates"})
 
+    # Phase 3: PPR graph expansion (replaces heuristic expansion)
+    ppr_ranked = []
+    paths = []
     if use_graph and n_iterations >= 2 and candidates:
-        seen_seeds: set[str] = set()
-        graph_passes = n_iterations - 1
+        try:
+            from importlib import import_module
 
-        for i in range(graph_passes):
-            top_n = max(5, 20 - i * 2)
-            seed_jids = list({c["sender_jid"] for c in candidates[:top_n]})
-            new_seeds = [j for j in seed_jids if j not in seen_seeds]
-            seen_seeds.update(seed_jids)
+            graph_search = import_module("wactx.graph_search")
+            ppr_score = graph_search.ppr_score
+            pathrag_flow = graph_search.pathrag_flow
+        except Exception:
+            from heapq import heappop, heappush
 
-            if not new_seeds and i >= 2:
-                all_jids = list({c["sender_jid"] for c in candidates[: top_n * 2]})
-                new_seeds = all_jids[: max(3, top_n // 2)]
-            if not new_seeds:
-                break
+            def _load_person_graph() -> tuple[
+                dict[str, list[tuple[str, float]]], dict[str, float]
+            ]:
+                adjacency: dict[str, dict[str, float]] = defaultdict(dict)
 
-            expanded = graph_expand_candidates(
-                conn, new_seeds, vectors, dims, top_k=max(5, top_k * 2 - i * 3)
-            )
-            if not expanded:
-                progress.append({"pass": i + 2, "label": "no new graph neighbours"})
-                break
-
-            prev_count = len(candidates)
-            candidates = rrf_fuse(
-                [
-                    (f"pass{i + 1}", candidates),
-                    (f"graph_{i + 1}", expanded),
+                edge_queries = [
+                    (
+                        """SELECT gp1.source_id, gp2.source_id, SUM(epm.message_count) * 3.0 AS weight
+                           FROM edge_person_messaged epm
+                           JOIN graph_persons gp1 ON epm.sender_person_id = gp1.person_id
+                           JOIN graph_persons gp2 ON epm.receiver_person_id = gp2.person_id
+                           GROUP BY gp1.source_id, gp2.source_id""",
+                        True,
+                    ),
+                    (
+                        """SELECT gp1.source_id, gp2.source_id, SUM(epc.exchange_count) * 5.0 AS weight
+                           FROM edge_person_conversed epc
+                           JOIN graph_persons gp1 ON epc.person1_id = gp1.person_id
+                           JOIN graph_persons gp2 ON epc.person2_id = gp2.person_id
+                           GROUP BY gp1.source_id, gp2.source_id""",
+                        True,
+                    ),
+                    (
+                        """SELECT gp1.source_id, gp2.source_id, SUM(epc.shared_groups) * 1.5 AS weight
+                           FROM edge_person_cooccurs epc
+                           JOIN graph_persons gp1 ON epc.person1_id = gp1.person_id
+                           JOIN graph_persons gp2 ON epc.person2_id = gp2.person_id
+                           GROUP BY gp1.source_id, gp2.source_id""",
+                        True,
+                    ),
+                    (
+                        """SELECT gp1.source_id, gp2.source_id,
+                                  SUM(LEAST(e1.mention_count, e2.mention_count)) * 2.0 AS weight
+                           FROM edge_person_mentions_entity e1
+                           JOIN edge_person_mentions_entity e2
+                             ON e1.entity_id = e2.entity_id AND e1.person_id < e2.person_id
+                           JOIN graph_persons gp1 ON e1.person_id = gp1.person_id
+                           JOIN graph_persons gp2 ON e2.person_id = gp2.person_id
+                           GROUP BY gp1.source_id, gp2.source_id""",
+                        True,
+                    ),
                 ]
+
+                for sql, bidirectional in edge_queries:
+                    try:
+                        rows = conn.execute(sql).fetchall()
+                    except Exception:
+                        continue
+                    for src, dst, weight in rows:
+                        if not src or not dst or src == dst or not weight:
+                            continue
+                        adjacency[src][dst] = adjacency[src].get(dst, 0.0) + float(
+                            weight
+                        )
+                        if bidirectional:
+                            adjacency[dst][src] = adjacency[dst].get(src, 0.0) + float(
+                                weight
+                            )
+
+                out_weight = {
+                    node: sum(neighbours.values())
+                    for node, neighbours in adjacency.items()
+                }
+                frozen = {
+                    node: sorted(neighbours.items(), key=lambda item: -item[1])
+                    for node, neighbours in adjacency.items()
+                }
+                return frozen, out_weight
+
+            def ppr_score(
+                conn: duckdb.DuckDBPyConnection,
+                seed_jids: list[str],
+                seed_scores: dict[str, float],
+                alpha: float = 0.85,
+                top_k: int = 50,
+            ) -> list[tuple[str, float]]:
+                del conn
+                adjacency, out_weight = _load_person_graph()
+                seeds = [
+                    jid for jid in seed_jids if jid in adjacency or seed_scores.get(jid)
+                ]
+                if not seeds:
+                    return []
+
+                personalization = {
+                    jid: max(seed_scores.get(jid, 0.0), 1e-9) for jid in seeds
+                }
+                total = sum(personalization.values()) or 1.0
+                personalization = {
+                    jid: score / total for jid, score in personalization.items()
+                }
+
+                nodes = set(adjacency)
+                nodes.update(personalization)
+                ranks = {node: personalization.get(node, 0.0) for node in nodes}
+
+                for _ in range(20):
+                    new_ranks = {
+                        node: (1.0 - alpha) * personalization.get(node, 0.0)
+                        for node in nodes
+                    }
+                    dangling = 0.0
+                    for node, rank in ranks.items():
+                        neighbours = adjacency.get(node, [])
+                        total_w = out_weight.get(node, 0.0)
+                        if not neighbours or total_w <= 0:
+                            dangling += rank
+                            continue
+                        for neighbour, weight in neighbours:
+                            new_ranks[neighbour] = new_ranks.get(neighbour, 0.0) + (
+                                alpha * rank * (weight / total_w)
+                            )
+                    if dangling:
+                        for node, pscore in personalization.items():
+                            new_ranks[node] = (
+                                new_ranks.get(node, 0.0) + alpha * dangling * pscore
+                            )
+                    delta = sum(
+                        abs(new_ranks.get(node, 0.0) - ranks.get(node, 0.0))
+                        for node in nodes
+                    )
+                    ranks = new_ranks
+                    if delta < 1e-8:
+                        break
+
+                return sorted(ranks.items(), key=lambda item: -item[1])[:top_k]
+
+            def pathrag_flow(
+                conn: duckdb.DuckDBPyConnection,
+                seed_jids: list[str],
+                alpha: float = 0.7,
+                theta: float = 0.3,
+                max_hops: int = 3,
+                top_k: int = 12,
+            ) -> list[dict]:
+                del conn
+                adjacency, out_weight = _load_person_graph()
+                results: list[dict] = []
+                seen_paths: set[tuple[str, ...]] = set()
+
+                for source in seed_jids:
+                    if source not in adjacency:
+                        continue
+                    heap: list[tuple[float, list[str], float]] = [(-1.0, [source], 1.0)]
+                    best_for_target: dict[str, float] = {}
+
+                    while heap:
+                        _neg_score, path, path_score = heappop(heap)
+                        node = path[-1]
+                        hops = len(path) - 1
+                        if hops >= max_hops:
+                            continue
+
+                        total_w = out_weight.get(node, 0.0) or 1.0
+                        for neighbour, weight in adjacency.get(node, []):
+                            if neighbour in path:
+                                continue
+                            edge_strength = weight / total_w
+                            next_score = path_score * (alpha * edge_strength + theta)
+                            next_path = path + [neighbour]
+                            target = neighbour
+                            if len(next_path) >= 2 and target not in seed_jids:
+                                if next_score > best_for_target.get(target, 0.0):
+                                    best_for_target[target] = next_score
+                                    path_key = tuple(next_path)
+                                    if path_key not in seen_paths:
+                                        seen_paths.add(path_key)
+                                        results.append(
+                                            {
+                                                "source": source,
+                                                "target": target,
+                                                "path": next_path,
+                                                "score": next_score,
+                                                "hops": len(next_path) - 1,
+                                            }
+                                        )
+                            if len(next_path) - 1 < max_hops and next_score >= theta:
+                                heappush(heap, (-next_score, next_path, next_score))
+
+                return sorted(results, key=lambda item: -item["score"])[:top_k]
+
+        seed_jids = list({c["sender_jid"] for c in candidates[:20]})
+        seed_scores = {}
+        for c in candidates[:20]:
+            jid = c["sender_jid"]
+            seed_scores[jid] = max(
+                seed_scores.get(jid, 0),
+                c.get("rrf_score", c.get("similarity", 0)),
             )
 
-            candidates = candidates[: max(top_k * 2, int(top_k * 3 * (0.85**i)))]
-            progress.append(
-                {
-                    "pass": i + 2,
-                    "label": f"+{len(new_seeds)} seeds → {len(candidates)} candidates",
-                }
-            )
+        ppr_ranked = ppr_score(
+            conn,
+            seed_jids,
+            seed_scores,
+            alpha=0.85,
+            top_k=top_k * 3,
+        )
+        progress.append({"label": f"PPR → {len(ppr_ranked)} people scored"})
+
+        if ppr_ranked:
+            ppr_jids = [jid for jid, _ in ppr_ranked[:30]]
+            ppr_lookup = {jid: score for jid, score in ppr_ranked}
+
+            # Fetch messages from PPR-ranked people via vector search
+            expanded = []
+            ppr_placeholders = ", ".join(["?"] * len(ppr_jids))
+            for qvec in vectors[:2]:
+                try:
+                    rows = conn.execute(
+                        f"""SELECT id, text_content, push_name, sender_jid, chat_jid, timestamp,
+                                   media_type, media_path,
+                                   array_cosine_similarity(embedding, ?::FLOAT[{dims}]) AS similarity
+                            FROM messages
+                            WHERE embedding IS NOT NULL
+                              AND sender_jid IN ({ppr_placeholders})
+                            ORDER BY similarity DESC LIMIT ?""",
+                        [qvec] + ppr_jids + [top_k * 2],
+                    ).fetchall()
+                except Exception:
+                    continue
+
+                for r in rows:
+                    ppr_s = ppr_lookup.get(r[3], 0)
+                    expanded.append(
+                        {
+                            "id": r[0],
+                            "text": r[1],
+                            "sender": r[2],
+                            "sender_jid": r[3],
+                            "chat_jid": r[4],
+                            "time": r[5],
+                            "media_type": r[6],
+                            "media_path": r[7],
+                            "similarity": float(r[8]),
+                            "ppr_score": ppr_s,
+                        }
+                    )
+
+            if expanded:
+                seen = set()
+                unique_expanded = []
+                for doc in sorted(expanded, key=lambda x: -x["similarity"]):
+                    if doc["id"] not in seen:
+                        seen.add(doc["id"])
+                        unique_expanded.append(doc)
+                candidates = rrf_fuse(
+                    [
+                        ("retrieval", candidates),
+                        ("ppr_expanded", unique_expanded),
+                    ]
+                )
+                progress.append({"label": f"PPR expansion → {len(candidates)} merged"})
+
+        # Phase 4: PathRAG flow for path insights
+        if n_iterations >= 3 and seed_jids:
+            paths = pathrag_flow(conn, seed_jids[:10], alpha=0.7, theta=0.3, max_hops=3)
+            if paths:
+                progress.append({"label": f"PathRAG → {len(paths)} paths"})
+
     candidates = candidates[: top_k * 4]
 
+    # Phase 5: Enrich + conversation context
     candidates = enrich_results(conn, candidates, config.search.owner_name, use_graph)
-    progress.append(
-        {"pass": "enrich", "label": f"Enriched {len(candidates)} with graph signals"}
-    )
 
-    if n_iterations >= 3:
-        candidates = fetch_conversation_context(conn, candidates, limit=top_k)
+    # Add PPR scores to candidates
+    if ppr_ranked:
+        ppr_lookup = {jid: score for jid, score in ppr_ranked}
+        for c in candidates:
+            c["ppr_score"] = ppr_lookup.get(c["sender_jid"], 0)
+
+    # Add community labels
+    if use_graph:
+        try:
+            for c in candidates:
+                row = conn.execute(
+                    "SELECT community_id FROM graph_persons WHERE source_id = ?",
+                    [c["sender_jid"]],
+                ).fetchone()
+                c["community_id"] = row[0] if row and row[0] >= 0 else -1
+        except Exception:
+            pass
+
+    candidates = fetch_conversation_context(conn, candidates, limit=top_k)
+    progress.append({"label": f"Enriched {len(candidates)} results"})
 
     people = find_related_people(candidates)
     insights = (
@@ -680,6 +816,10 @@ def run_search(
         if use_graph
         else {}
     )
+
+    # Add paths to insights
+    if paths:
+        insights["paths"] = paths[:5]
 
     return {
         "query": query,

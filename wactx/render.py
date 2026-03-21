@@ -39,10 +39,9 @@ def render_search_results(data: dict) -> None:
 
     if progress:
         header_lines.append("")
-        steps = []
-        for p in progress:
-            steps.append(f"[dim]{p['label']}[/dim]")
-        header_lines.append("  " + "  \u2192  ".join(steps))
+        for i, p in enumerate(progress):
+            marker = "\u2713" if i < len(progress) - 1 else "\u25b6"
+            header_lines.append(f"  [dim]{marker} {p['label']}[/dim]")
 
     console.print(
         Panel(
@@ -85,6 +84,11 @@ def render_search_results(data: dict) -> None:
 
         graph_parts: list[str] = []
         if use_graph:
+            community_id = None
+            if p.get("messages"):
+                community_id = p["messages"][0].get("community_id", -1)
+                if community_id is not None and community_id >= 0:
+                    graph_parts.append(f"Community #{community_id}")
             if p.get("dm_volume"):
                 graph_parts.append(f"{p['dm_volume']} DMs with you")
             if p.get("shared_groups"):
@@ -149,6 +153,25 @@ def render_search_results(data: dict) -> None:
                 f"{r['person1']} \u2194 {r['person2']} ({r['exchanges']}x{groups})"
             )
         console.print(f"[bold]Key relationships:[/bold] " + "  \u2502  ".join(rel_strs))
+
+    paths = insights.get("paths", [])
+    if paths:
+        path_strs = []
+        for p in paths[:3]:
+            try:
+                names = []
+                for jid in p["path"]:
+                    row_result = None
+                    for person in people[:15]:
+                        if person.get("sender_jid") == jid:
+                            row_result = person["display_name"]
+                            break
+                    names.append(_trunc(row_result or jid.split("@")[0], 15))
+                path_strs.append(f"{' → '.join(names)} (score:{p['score']:.2f})")
+            except Exception:
+                pass
+        if path_strs:
+            console.print(f"[bold]Paths:[/bold] " + "  |  ".join(path_strs))
 
 
 def render_stats(stats: dict) -> None:
