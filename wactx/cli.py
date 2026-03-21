@@ -355,9 +355,15 @@ def graph(ctx):
 @click.option("--variants", type=int, default=None)
 @click.option("--top", type=int, default=None)
 @click.option("--no-graph", is_flag=True)
+@click.option(
+    "--iterations",
+    type=int,
+    default=None,
+    help="Graph expansion iterations (default: from depth preset)",
+)
 @click.option("--json", "output_json", is_flag=True)
 @click.pass_context
-def search(ctx, query, depth, variants, top, no_graph, output_json):
+def search(ctx, query, depth, variants, top, no_graph, iterations, output_json):
     """Search messages with semantic + graph search."""
     from wactx.search import run_search
     from wactx.db import get_connection
@@ -367,7 +373,14 @@ def search(ctx, query, depth, variants, top, no_graph, output_json):
     conn = get_connection(cfg, read_only=True)
 
     data = run_search(
-        conn, cfg, query, depth=depth, variants=variants, top=top, no_graph=no_graph
+        conn,
+        cfg,
+        query,
+        depth=depth,
+        variants=variants,
+        top=top,
+        no_graph=no_graph,
+        iterations=iterations,
     )
     conn.close()
 

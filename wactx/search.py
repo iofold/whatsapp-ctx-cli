@@ -587,12 +587,13 @@ def run_search(
     variants: int | None = None,
     top: int | None = None,
     no_graph: bool = False,
+    iterations: int | None = None,
 ) -> dict:
     preset = DEPTH_PRESETS.get(depth, DEPTH_PRESETS["balanced"])
     n_variants = variants if variants is not None else preset["variants"]
     top_k = top if top is not None else preset["top"]
     use_graph = preset["graph"] and not no_graph
-    iterations = preset.get("iterations", 1)
+    n_iterations = iterations if iterations is not None else preset.get("iterations", 1)
 
     client = OpenAI(base_url=config.api.base_url, api_key=config.api.key)
     t0 = time.time()
@@ -601,6 +602,7 @@ def run_search(
     vectors = embed_queries(client, config, queries)
     dims = config.api.embedding_dims
 
+    # === PASS 1: BM25 + vector candidate generation ===
     bm25_results = bm25_search(conn, query, top_k=top_k * 3)
     vector_results = semantic_search(conn, vectors, dims, top_k * 3)
 
@@ -613,40 +615,40 @@ def run_search(
 
     candidates = candidates[: top_k * 3]
 
-    if use_graph and iterations >= 2 and candidates:
-        seed_jids_pass1 = list({c["sender_jid"] for c in candidates[:20]})
-        expanded_pass1 = graph_expand_candidates(
-            conn, seed_jids_pass1, vectors, dims, top_k=top_k * 2
-        )
-        if expanded_pass1:
+    # === PASS 2..N: Iterative graph expansion with pruning ===
+    if use_graph and n_iterations >= 2 and candidates:
+        seen_seeds: set[str] = set()
+        graph_passes = n_iterations - 1
+
+        for i in range(graph_passes):
+            top_n = max(5, 20 - i * 3)
+            seed_jids = list({c["sender_jid"] for c in candidates[:top_n]})
+            new_seeds = [j for j in seed_jids if j not in seen_seeds]
+            seen_seeds.update(seed_jids)
+
+            if not new_seeds:
+                break
+
+            expanded = graph_expand_candidates(
+                conn, new_seeds, vectors, dims, top_k=max(5, top_k * 2 - i * 5)
+            )
+            if not expanded:
+                break
+
             candidates = rrf_fuse(
                 [
-                    ("pass1", candidates),
-                    ("graph_pass1", expanded_pass1),
+                    (f"pass{i + 1}", candidates),
+                    (f"graph_{i + 1}", expanded),
                 ]
             )
 
-        candidates = candidates[: top_k * 2]
-
-        seed_jids_pass2 = list({c["sender_jid"] for c in candidates[:15]})
-        new_seeds = [j for j in seed_jids_pass2 if j not in seed_jids_pass1]
-        if new_seeds:
-            expanded_pass2 = graph_expand_candidates(
-                conn, new_seeds, vectors, dims, top_k=top_k
-            )
-            if expanded_pass2:
-                candidates = rrf_fuse(
-                    [
-                        ("merged", candidates),
-                        ("graph_pass2", expanded_pass2),
-                    ]
-                )
+            candidates = candidates[: max(top_k, top_k * 3 - i * top_k)]
 
     candidates = candidates[: top_k * 4]
 
     candidates = enrich_results(conn, candidates, config.search.owner_name, use_graph)
 
-    if iterations >= 3:
+    if n_iterations >= 3:
         candidates = fetch_conversation_context(conn, candidates, limit=top_k)
 
     people = find_related_people(candidates)
