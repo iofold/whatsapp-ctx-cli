@@ -136,6 +136,25 @@ _STOP_ENTITIES: set[str] = {
     "ji",
     "sir",
     "spc",
+    "intro",
+    "time",
+    "ca",
+    "dming",
+    "saas",
+    "b2b",
+    "b2c",
+    "bengaluru",
+    "gurgaon",
+    "noida",
+    "chennai",
+    "kolkata",
+    "jaipur",
+    "chandigarh",
+    "china",
+    "japan",
+    "canada",
+    "europe",
+    "africa",
 }
 
 _TYPE_OVERRIDES: dict[str, str] = {
@@ -158,6 +177,12 @@ _TYPE_OVERRIDES: dict[str, str] = {
     "langchain": "tech",
     "langgraph": "tech",
     "autogpt": "tech",
+    "gpu": "tech",
+    "mcp": "tech",
+    "aws": "tech",
+    "github": "tech",
+    "linkedin": "tech",
+    "phd": "org",
 }
 
 _ALIAS_MAP: dict[str, str] = {
@@ -342,7 +367,95 @@ async def extract_entities(
             flat[i : i + 1000],
         )
 
+    deduped = dedup_entities(conn)
+    log.info("Dedup pass merged %d entity values", deduped)
     return len(flat)
+
+
+def dedup_entities(conn: duckdb.DuckDBPyConnection) -> int:
+    from difflib import SequenceMatcher
+
+    if not table_exists(conn, "extracted_entities"):
+        return 0
+
+    rows = conn.execute("""
+        SELECT entity_type, entity_value, COUNT(*) as c
+        FROM extracted_entities
+        WHERE entity_type != 'url'
+        GROUP BY entity_type, entity_value
+        HAVING COUNT(*) >= 2
+        ORDER BY c DESC
+    """).fetchall()
+
+    by_type: dict[str, list[tuple[str, int]]] = {}
+    for etype, val, count in rows:
+        by_type.setdefault(etype, []).append((val, count))
+
+    merges: dict[str, str] = {}
+
+    for etype, entities in by_type.items():
+        entities.sort(key=lambda x: -x[1])
+        canonicals: list[tuple[str, int]] = []
+
+        for val, count in entities:
+            v_lower = val.lower()
+            merged = False
+
+            for canon, canon_count in canonicals:
+                c_lower = canon.lower()
+
+                if v_lower == c_lower:
+                    merges[val] = canon
+                    merged = True
+                    break
+
+                if len(v_lower) > 3 and len(c_lower) > 3:
+                    if v_lower in c_lower or c_lower in v_lower:
+                        shorter = val if len(val) < len(canon) else canon
+                        longer = canon if shorter == val else val
+                        target = longer if count < canon_count else shorter
+                        if target != val:
+                            merges[val] = target
+                        merged = True
+                        break
+
+                if len(v_lower) > 5 and len(c_lower) > 5:
+                    ratio = SequenceMatcher(None, v_lower, c_lower).ratio()
+                    if ratio > 0.85:
+                        merges[val] = canon
+                        merged = True
+                        break
+
+            if not merged:
+                canonicals.append((val, count))
+
+    if not merges:
+        return 0
+
+    updated = 0
+    for old_val, new_val in merges.items():
+        try:
+            conn.execute(
+                "UPDATE extracted_entities SET entity_value = ? WHERE entity_value = ?",
+                [new_val, old_val],
+            )
+            updated += 1
+        except Exception:
+            pass
+
+    try:
+        conn.execute("""
+            DELETE FROM extracted_entities
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid)
+                FROM extracted_entities
+                GROUP BY message_id, entity_type, entity_value
+            )
+        """)
+    except Exception:
+        pass
+
+    return updated
 
 
 def get_entity_stats(conn: duckdb.DuckDBPyConnection) -> dict:
