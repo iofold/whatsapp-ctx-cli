@@ -386,9 +386,9 @@ def search(ctx, query, depth, variants, top, no_graph, iterations, output_json):
         no_graph=no_graph,
         iterations=iterations,
     )
-    conn.close()
 
     if output_json:
+        conn.close()
         out = {
             "query": data["query"],
             "depth": data["depth"],
@@ -430,7 +430,9 @@ def search(ctx, query, depth, variants, top, no_graph, iterations, output_json):
     else:
         from wactx.render import render_search_results
 
+        data["_conn"] = conn
         render_search_results(data)
+        conn.close()
 
 
 @cli.command()

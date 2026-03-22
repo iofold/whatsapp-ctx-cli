@@ -18,6 +18,29 @@ def _trunc(s: str, n: int) -> str:
     return s[:n] + "\u2026" if len(s) > n else s
 
 
+def _community_labels(data: dict) -> dict[int, str]:
+    conn = data.get("_conn")
+    if not conn:
+        return {}
+    try:
+        rows = conn.execute("""
+            SELECT gp.community_id,
+                   (SELECT gg.group_name
+                    FROM edge_person_in_group epg
+                    JOIN graph_groups gg ON epg.group_jid = gg.group_jid
+                    JOIN graph_persons gp2 ON epg.person_id = gp2.person_id
+                    WHERE gp2.community_id = gp.community_id
+                    GROUP BY gg.group_name
+                    ORDER BY SUM(epg.message_count) DESC LIMIT 1) AS top_group
+            FROM graph_persons gp
+            WHERE gp.community_id >= 0
+            GROUP BY gp.community_id
+        """).fetchall()
+        return {r[0]: r[1] for r in rows if r[1]}
+    except Exception:
+        return {}
+
+
 def render_search_results(data: dict) -> None:
     query = data["query"]
     queries_used = data["queries_used"]
@@ -52,6 +75,7 @@ def render_search_results(data: dict) -> None:
     )
 
     w = console.width or 120
+    comm_labels = _community_labels(data) if use_graph else {}
 
     connection_map: dict[str, dict] = {}
     for c in insights.get("connections", []):
@@ -88,11 +112,13 @@ def render_search_results(data: dict) -> None:
             if p.get("messages"):
                 community_id = p["messages"][0].get("community_id", -1)
                 if community_id is not None and community_id >= 0:
-                    graph_parts.append(f"Community #{community_id}")
+                    label = comm_labels.get(community_id)
+                    if label:
+                        graph_parts.append(f"[bold]{_trunc(label, 30)}[/bold] circle")
             if p.get("dm_volume"):
                 graph_parts.append(f"{p['dm_volume']} DMs with you")
             if p.get("shared_groups"):
-                grps = ", ".join(_trunc(g, 25) for g in p["shared_groups"][:3])
+                grps = ", ".join(_trunc(g, 30) for g in p["shared_groups"][:3])
                 more = (
                     f" +{len(p['shared_groups']) - 3}"
                     if len(p["shared_groups"]) > 3
@@ -104,16 +130,26 @@ def render_search_results(data: dict) -> None:
                 graph_parts.append(f"Talks about: {ents}")
 
         if graph_parts:
-            lines.append("[dim]" + " · ".join(graph_parts) + "[/dim]")
+            lines.append("[dim]" + " \u00b7 ".join(graph_parts) + "[/dim]")
             lines.append("")
 
+        msg_width = w - 8
         for j, m in enumerate(msgs[:3]):
             where = m.get("group_name", "")
             ts = _ts(m["time"])
-            text = m["text"] or m.get("media_path") or ""
+            text = (m["text"] or m.get("media_path") or "").strip()
             media = "\U0001f4f7 " if m.get("media_type") else ""
-            preview = media + _trunc(text, w - 20)
-            lines.append(f"[dim]{ts} {_trunc(where, 30)}:[/dim]  {preview}")
+
+            header = f"[dim]{ts} {_trunc(where, 30)}:[/dim]"
+            content = media + text
+            if len(content) > msg_width:
+                line1 = content[:msg_width]
+                line2 = content[msg_width : msg_width * 2]
+                lines.append(f"{header}  {line1}")
+                if line2.strip():
+                    lines.append(f"{'':>18}{_trunc(line2, msg_width)}")
+            else:
+                lines.append(f"{header}  {content}")
 
         remaining = p["message_count"] - min(3, len(msgs))
         if remaining > 0:
