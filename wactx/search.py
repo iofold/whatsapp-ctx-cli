@@ -297,10 +297,18 @@ def find_related_people(results: list[dict]) -> list[dict]:
             p["entities"] = r["entities"]
         p["messages"].append(r)
 
-    for p in by_person.values():
-        retrieval = max(p["max_rrf"] * 100, p["max_similarity"])
+    people_list = list(by_person.values())
+    if not people_list:
+        return []
 
-        ppr = p.get("max_ppr", 0) * 1000
+    max_rrf = max((p["max_rrf"] for p in people_list), default=1) or 1
+    max_sim = max((p["max_similarity"] for p in people_list), default=1) or 1
+    max_ppr = max((p["max_ppr"] for p in people_list), default=1) or 1e-10
+
+    for p in people_list:
+        retrieval = max(p["max_rrf"] / max_rrf, p["max_similarity"] / max_sim)
+
+        ppr = p["max_ppr"] / max_ppr
 
         graph = min(
             1.0,
@@ -314,7 +322,7 @@ def find_related_people(results: list[dict]) -> list[dict]:
 
         p["score"] = 0.35 * retrieval + 0.35 * ppr + 0.15 * graph + 0.15 * conv
 
-    return sorted(by_person.values(), key=lambda x: x["score"], reverse=True)
+    return sorted(people_list, key=lambda x: x["score"], reverse=True)
 
 
 def compute_graph_insights(
@@ -780,7 +788,9 @@ def run_search(
 
         # Phase 4: PathRAG flow for path insights
         if n_iterations >= 3 and seed_jids:
-            paths = pathrag_flow(conn, seed_jids[:10], alpha=0.7, theta=0.3, max_hops=3)
+            paths = pathrag_flow(
+                conn, seed_jids[:10], alpha=0.7, theta=0.01, max_hops=3
+            )
             if paths:
                 progress.append({"label": f"PathRAG → {len(paths)} paths"})
 

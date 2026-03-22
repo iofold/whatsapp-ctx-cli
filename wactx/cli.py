@@ -390,12 +390,14 @@ def search(ctx, query, depth, variants, top, no_graph, iterations, output_json):
             "depth": data["depth"],
             "elapsed_s": round(data["elapsed"], 2),
             "queries_used": data["queries_used"],
+            "progress": data.get("progress", []),
             "people": [
                 {
                     "name": p["display_name"],
                     "phone": p.get("phone", ""),
                     "score": round(p["score"], 3),
                     "similarity": round(p["max_similarity"], 3),
+                    "ppr_score": round(p.get("max_ppr", 0), 8),
                     "dm_volume": p["dm_volume"],
                     "shared_groups": p["shared_groups"],
                     "entities": [
