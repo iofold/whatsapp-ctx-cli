@@ -179,18 +179,18 @@ def pathrag_flow(
     conn: duckdb.DuckDBPyConnection,
     seed_jids: list[str],
     alpha: float = 0.7,
-    theta: float = 0.3,
+    theta: float = 0.01,
     max_hops: int = 3,
     top_k: int = 20,
 ) -> list[dict]:
-    """PathRAG-style flow propagation between seed node pairs.
+    """PathRAG flow: propagate resources from each seed, then find shortest paths
+    between seed pairs through high-resource intermediaries.
 
     S(v_i) = Σ [α · S(v_j) / degree(v_j)]
-    Early stop when S(v_i) / degree(v_i) < θ
     Path score = avg(S(v_i)) across path nodes.
-
-    Returns [{"source": jid, "target": jid, "path": [jids], "score": float}]
     """
+    import networkx as nx
+
     G = _build_nx_graph(conn)
     if G.number_of_nodes() == 0:
         return []
@@ -200,52 +200,61 @@ def pathrag_flow(
         return []
 
     t0 = time.time()
-    all_paths: list[dict] = []
 
-    for i, source in enumerate(seed_set[:8]):
+    seed_resources: dict[str, dict[str, float]] = {}
+    for source in seed_set[:8]:
         resource: dict[str, float] = defaultdict(float)
         resource[source] = 1.0
 
         frontier = {source}
-        for hop in range(max_hops):
+        for _hop in range(max_hops):
             next_frontier: set[str] = set()
-            for node in frontier:
-                out_neighbors = list(G.successors(node))
-                if not out_neighbors:
+            for node in list(frontier)[:500]:
+                out_deg = G.out_degree(node)
+                if out_deg == 0:
                     continue
-                share = alpha * resource[node] / len(out_neighbors)
-                if share < theta * 0.01:
+                share = alpha * resource[node] / out_deg
+                if share < theta * 0.001:
                     continue
-                for neighbor in out_neighbors:
+                for neighbor in G.successors(node):
                     resource[neighbor] += share
-                    if (
-                        resource[neighbor] / max(1, G.out_degree(neighbor))
-                        >= theta * 0.01
-                    ):
+                    if resource[neighbor] > theta * 0.001:
                         next_frontier.add(neighbor)
             frontier = next_frontier
             if not frontier:
                 break
+        seed_resources[source] = resource
 
+    all_paths: list[dict] = []
+    for i, source in enumerate(seed_set[:8]):
         for target in seed_set[i + 1 :]:
-            if target not in resource or resource[target] < 0.01:
-                continue
-            try:
-                import networkx as nx
+            src_res = seed_resources.get(source, {})
+            tgt_res = seed_resources.get(target, {})
 
-                for path in nx.all_simple_paths(G, source, target, cutoff=max_hops):
-                    path_score = sum(resource.get(n, 0) for n in path) / len(path)
-                    if path_score > 0.01:
-                        all_paths.append(
-                            {
-                                "source": source,
-                                "target": target,
-                                "path": path,
-                                "score": path_score,
-                                "hops": len(path) - 1,
-                            }
-                        )
-            except Exception:
+            if (
+                src_res.get(target, 0) < theta * 0.0001
+                and tgt_res.get(source, 0) < theta * 0.0001
+            ):
+                continue
+
+            try:
+                path = nx.shortest_path(G, source, target, weight=None)
+                if len(path) > max_hops + 1:
+                    continue
+                combined_resource = {
+                    n: max(src_res.get(n, 0), tgt_res.get(n, 0)) for n in path
+                }
+                path_score = sum(combined_resource.values()) / len(path)
+                all_paths.append(
+                    {
+                        "source": source,
+                        "target": target,
+                        "path": path,
+                        "score": path_score,
+                        "hops": len(path) - 1,
+                    }
+                )
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
                 pass
 
     all_paths.sort(key=lambda x: -x["score"])

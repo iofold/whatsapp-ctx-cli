@@ -28,6 +28,10 @@ def cli(ctx, config_path, verbose):
         format="%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%H:%M:%S",
     )
+    if not verbose:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("openai").setLevel(logging.WARNING)
+        logging.getLogger("wactx.graph_search").setLevel(logging.WARNING)
     cfg_path = Path(config_path) if config_path else None
     ctx.ensure_object(dict)
     ctx.obj["config"] = load_config(cfg_path)

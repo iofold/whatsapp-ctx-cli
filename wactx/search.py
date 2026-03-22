@@ -496,17 +496,26 @@ def run_search(
     if ctx is not None:
         output_json = output_json or bool(ctx.params.get("output_json"))
 
+    from rich.console import Console
+
+    console = Console()
     client = OpenAI(base_url=config.api.base_url, api_key=config.api.key)
     t0 = time.time()
     progress: list[dict] = []
+    show = not output_json
 
-    # Phase 1: Query expansion + embedding
+    if show:
+        console.print("[dim]  Expanding query...[/dim]", end="\r")
     queries = expand_query(client, config, query, n_variants)
+    if show:
+        console.print(
+            f"[dim]  \u2713 Query → {len(queries)} variants. Searching...[/dim]",
+            end="\r",
+        )
     vectors = embed_queries(client, config, queries)
     dims = config.api.embedding_dims
     progress.append({"label": f"Query → {len(queries)} variants"})
 
-    # Phase 2: BM25 + vector candidate generation
     bm25_results = bm25_search(conn, query, top_k=top_k * 3)
     vector_results = semantic_search(conn, vectors, dims, top_k * 3)
 
@@ -519,200 +528,16 @@ def run_search(
 
     candidates = candidates[: top_k * 3]
     progress.append({"label": f"BM25 + vector → {len(candidates)} candidates"})
+    if show:
+        console.print(
+            f"[dim]  \u2713 {len(candidates)} candidates. Running PPR...[/dim]",
+            end="\r",
+        )
 
-    # Phase 3: PPR graph expansion (replaces heuristic expansion)
     ppr_ranked = []
     paths = []
     if use_graph and n_iterations >= 2 and candidates:
-        try:
-            from importlib import import_module
-
-            graph_search = import_module("wactx.graph_search")
-            ppr_score = graph_search.ppr_score
-            pathrag_flow = graph_search.pathrag_flow
-        except Exception:
-            from heapq import heappop, heappush
-
-            def _load_person_graph() -> tuple[
-                dict[str, list[tuple[str, float]]], dict[str, float]
-            ]:
-                adjacency: dict[str, dict[str, float]] = defaultdict(dict)
-
-                edge_queries = [
-                    (
-                        """SELECT gp1.source_id, gp2.source_id, SUM(epm.message_count) * 3.0 AS weight
-                           FROM edge_person_messaged epm
-                           JOIN graph_persons gp1 ON epm.sender_person_id = gp1.person_id
-                           JOIN graph_persons gp2 ON epm.receiver_person_id = gp2.person_id
-                           GROUP BY gp1.source_id, gp2.source_id""",
-                        True,
-                    ),
-                    (
-                        """SELECT gp1.source_id, gp2.source_id, SUM(epc.exchange_count) * 5.0 AS weight
-                           FROM edge_person_conversed epc
-                           JOIN graph_persons gp1 ON epc.person1_id = gp1.person_id
-                           JOIN graph_persons gp2 ON epc.person2_id = gp2.person_id
-                           GROUP BY gp1.source_id, gp2.source_id""",
-                        True,
-                    ),
-                    (
-                        """SELECT gp1.source_id, gp2.source_id, SUM(epc.shared_groups) * 1.5 AS weight
-                           FROM edge_person_cooccurs epc
-                           JOIN graph_persons gp1 ON epc.person1_id = gp1.person_id
-                           JOIN graph_persons gp2 ON epc.person2_id = gp2.person_id
-                           GROUP BY gp1.source_id, gp2.source_id""",
-                        True,
-                    ),
-                    (
-                        """SELECT gp1.source_id, gp2.source_id,
-                                  SUM(LEAST(e1.mention_count, e2.mention_count)) * 2.0 AS weight
-                           FROM edge_person_mentions_entity e1
-                           JOIN edge_person_mentions_entity e2
-                             ON e1.entity_id = e2.entity_id AND e1.person_id < e2.person_id
-                           JOIN graph_persons gp1 ON e1.person_id = gp1.person_id
-                           JOIN graph_persons gp2 ON e2.person_id = gp2.person_id
-                           GROUP BY gp1.source_id, gp2.source_id""",
-                        True,
-                    ),
-                ]
-
-                for sql, bidirectional in edge_queries:
-                    try:
-                        rows = conn.execute(sql).fetchall()
-                    except Exception:
-                        continue
-                    for src, dst, weight in rows:
-                        if not src or not dst or src == dst or not weight:
-                            continue
-                        adjacency[src][dst] = adjacency[src].get(dst, 0.0) + float(
-                            weight
-                        )
-                        if bidirectional:
-                            adjacency[dst][src] = adjacency[dst].get(src, 0.0) + float(
-                                weight
-                            )
-
-                out_weight = {
-                    node: sum(neighbours.values())
-                    for node, neighbours in adjacency.items()
-                }
-                frozen = {
-                    node: sorted(neighbours.items(), key=lambda item: -item[1])
-                    for node, neighbours in adjacency.items()
-                }
-                return frozen, out_weight
-
-            def ppr_score(
-                conn: duckdb.DuckDBPyConnection,
-                seed_jids: list[str],
-                seed_scores: dict[str, float],
-                alpha: float = 0.85,
-                top_k: int = 50,
-            ) -> list[tuple[str, float]]:
-                del conn
-                adjacency, out_weight = _load_person_graph()
-                seeds = [
-                    jid for jid in seed_jids if jid in adjacency or seed_scores.get(jid)
-                ]
-                if not seeds:
-                    return []
-
-                personalization = {
-                    jid: max(seed_scores.get(jid, 0.0), 1e-9) for jid in seeds
-                }
-                total = sum(personalization.values()) or 1.0
-                personalization = {
-                    jid: score / total for jid, score in personalization.items()
-                }
-
-                nodes = set(adjacency)
-                nodes.update(personalization)
-                ranks = {node: personalization.get(node, 0.0) for node in nodes}
-
-                for _ in range(20):
-                    new_ranks = {
-                        node: (1.0 - alpha) * personalization.get(node, 0.0)
-                        for node in nodes
-                    }
-                    dangling = 0.0
-                    for node, rank in ranks.items():
-                        neighbours = adjacency.get(node, [])
-                        total_w = out_weight.get(node, 0.0)
-                        if not neighbours or total_w <= 0:
-                            dangling += rank
-                            continue
-                        for neighbour, weight in neighbours:
-                            new_ranks[neighbour] = new_ranks.get(neighbour, 0.0) + (
-                                alpha * rank * (weight / total_w)
-                            )
-                    if dangling:
-                        for node, pscore in personalization.items():
-                            new_ranks[node] = (
-                                new_ranks.get(node, 0.0) + alpha * dangling * pscore
-                            )
-                    delta = sum(
-                        abs(new_ranks.get(node, 0.0) - ranks.get(node, 0.0))
-                        for node in nodes
-                    )
-                    ranks = new_ranks
-                    if delta < 1e-8:
-                        break
-
-                return sorted(ranks.items(), key=lambda item: -item[1])[:top_k]
-
-            def pathrag_flow(
-                conn: duckdb.DuckDBPyConnection,
-                seed_jids: list[str],
-                alpha: float = 0.7,
-                theta: float = 0.3,
-                max_hops: int = 3,
-                top_k: int = 12,
-            ) -> list[dict]:
-                del conn
-                adjacency, out_weight = _load_person_graph()
-                results: list[dict] = []
-                seen_paths: set[tuple[str, ...]] = set()
-
-                for source in seed_jids:
-                    if source not in adjacency:
-                        continue
-                    heap: list[tuple[float, list[str], float]] = [(-1.0, [source], 1.0)]
-                    best_for_target: dict[str, float] = {}
-
-                    while heap:
-                        _neg_score, path, path_score = heappop(heap)
-                        node = path[-1]
-                        hops = len(path) - 1
-                        if hops >= max_hops:
-                            continue
-
-                        total_w = out_weight.get(node, 0.0) or 1.0
-                        for neighbour, weight in adjacency.get(node, []):
-                            if neighbour in path:
-                                continue
-                            edge_strength = weight / total_w
-                            next_score = path_score * (alpha * edge_strength + theta)
-                            next_path = path + [neighbour]
-                            target = neighbour
-                            if len(next_path) >= 2 and target not in seed_jids:
-                                if next_score > best_for_target.get(target, 0.0):
-                                    best_for_target[target] = next_score
-                                    path_key = tuple(next_path)
-                                    if path_key not in seen_paths:
-                                        seen_paths.add(path_key)
-                                        results.append(
-                                            {
-                                                "source": source,
-                                                "target": target,
-                                                "path": next_path,
-                                                "score": next_score,
-                                                "hops": len(next_path) - 1,
-                                            }
-                                        )
-                            if len(next_path) - 1 < max_hops and next_score >= theta:
-                                heappush(heap, (-next_score, next_path, next_score))
-
-                return sorted(results, key=lambda item: -item["score"])[:top_k]
+        from wactx.graph_search import ppr_score, pathrag_flow
 
         seed_jids = list({c["sender_jid"] for c in candidates[:20]})
         seed_scores = {}
@@ -731,6 +556,11 @@ def run_search(
             top_k=top_k * 3,
         )
         progress.append({"label": f"PPR → {len(ppr_ranked)} people scored"})
+        if show:
+            console.print(
+                f"[dim]  \u2713 PPR scored {len(ppr_ranked)} people. Expanding...[/dim]",
+                end="\r",
+            )
 
         if ppr_ranked:
             ppr_jids = [jid for jid, _ in ppr_ranked[:30]]
