@@ -18,25 +18,43 @@ def _trunc(s: str, n: int) -> str:
     return s[:n] + "\u2026" if len(s) > n else s
 
 
-def _community_labels(data: dict) -> dict[int, str]:
+def _community_info(data: dict) -> dict[int, dict]:
     conn = data.get("_conn")
     if not conn:
         return {}
     try:
         rows = conn.execute("""
             SELECT gp.community_id,
+                   COUNT(*) AS member_count,
                    (SELECT gg.group_name
                     FROM edge_person_in_group epg
                     JOIN graph_groups gg ON epg.group_jid = gg.group_jid
                     JOIN graph_persons gp2 ON epg.person_id = gp2.person_id
                     WHERE gp2.community_id = gp.community_id
                     GROUP BY gg.group_name
-                    ORDER BY SUM(epg.message_count) DESC LIMIT 1) AS top_group
+                    ORDER BY SUM(epg.message_count) DESC LIMIT 1) AS top_group,
+                   (SELECT LIST(gp3.display_name ORDER BY gp3.display_name)
+                    FROM graph_persons gp3
+                    WHERE gp3.community_id = gp.community_id
+                      AND gp3.display_name IS NOT NULL
+                      AND gp3.display_name != ''
+                      AND gp3.display_name NOT LIKE '%@%'
+                    LIMIT 5) AS sample_members
             FROM graph_persons gp
             WHERE gp.community_id >= 0
             GROUP BY gp.community_id
         """).fetchall()
-        return {r[0]: r[1] for r in rows if r[1]}
+        result = {}
+        for cid, count, group, members in rows:
+            if not group:
+                continue
+            top_names = [m for m in (members or []) if m and "@" not in m][:4]
+            result[cid] = {
+                "label": group,
+                "count": count,
+                "members": top_names,
+            }
+        return result
     except Exception:
         return {}
 
@@ -75,7 +93,7 @@ def render_search_results(data: dict) -> None:
     )
 
     w = console.width or 120
-    comm_labels = _community_labels(data) if use_graph else {}
+    comm_info = _community_info(data) if use_graph else {}
 
     connection_map: dict[str, dict] = {}
     for c in insights.get("connections", []):
@@ -112,9 +130,19 @@ def render_search_results(data: dict) -> None:
             if p.get("messages"):
                 community_id = p["messages"][0].get("community_id", -1)
                 if community_id is not None and community_id >= 0:
-                    label = comm_labels.get(community_id)
-                    if label:
-                        graph_parts.append(f"[bold]{_trunc(label, 30)}[/bold] circle")
+                    info = comm_info.get(community_id)
+                    if info:
+                        others = [m for m in info["members"] if m != name][:3]
+                        others_str = ""
+                        if others:
+                            others_str = f" ({', '.join(others)}"
+                            remaining = info["count"] - len(others) - 1
+                            if remaining > 0:
+                                others_str += f" +{remaining}"
+                            others_str += ")"
+                        graph_parts.append(
+                            f"[bold]{_trunc(info['label'], 30)}[/bold]{others_str}"
+                        )
             if p.get("dm_volume"):
                 graph_parts.append(f"{p['dm_volume']} DMs with you")
             if p.get("shared_groups"):

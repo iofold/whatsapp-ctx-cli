@@ -25,9 +25,173 @@ _SPACY_TO_ENTITY_TYPE: dict[str, str] = {
     "EVENT": "event",
     "PRODUCT": "tech",
     "WORK_OF_ART": "tech",
-    "DATE": "event",
     "FAC": "org",
 }
+
+_STOP_ENTITIES: set[str] = {
+    "ai",
+    "dm",
+    "us",
+    "usa",
+    "uk",
+    "api",
+    "llm",
+    "ui",
+    "ux",
+    "sf",
+    "ip",
+    "gtm",
+    "cc",
+    "cli",
+    "sdk",
+    "vc",
+    "pm",
+    "cto",
+    "ceo",
+    "hr",
+    "pr",
+    "qa",
+    "ot",
+    "it",
+    "ml",
+    "dl",
+    "nlp",
+    "cv",
+    "rl",
+    "ops",
+    "swe",
+    "oss",
+    "india",
+    "bangalore",
+    "mumbai",
+    "delhi",
+    "chennai",
+    "hyderabad",
+    "pune",
+    "san francisco",
+    "new york",
+    "london",
+    "singapore",
+    "dubai",
+    "austin",
+    "today",
+    "tomorrow",
+    "yesterday",
+    "daily",
+    "weekly",
+    "next week",
+    "last week",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "2024",
+    "2025",
+    "2026",
+    "2027",
+    "the",
+    "a",
+    "an",
+    "this",
+    "that",
+    "one",
+    "two",
+    "three",
+    "max",
+    "hey",
+    "hi",
+    "hello",
+    "thanks",
+    "thank",
+    "yes",
+    "no",
+    "ok",
+    "lol",
+    "haha",
+    "google",
+    "apple",
+    "meta",
+    "amazon",
+    "microsoft",
+    "holi",
+    "diwali",
+    "christmas",
+    "hai",
+    "bhai",
+    "ji",
+    "sir",
+    "spc",
+}
+
+_TYPE_OVERRIDES: dict[str, str] = {
+    "claude": "tech",
+    "claude code": "tech",
+    "chatgpt": "tech",
+    "gpt": "tech",
+    "gemini": "tech",
+    "copilot": "tech",
+    "cursor": "tech",
+    "openai": "org",
+    "anthropic": "org",
+    "whatsapp": "tech",
+    "linkedin": "tech",
+    "slack": "tech",
+    "kubernetes": "tech",
+    "docker": "tech",
+    "react": "tech",
+    "python": "tech",
+    "langchain": "tech",
+    "langgraph": "tech",
+    "autogpt": "tech",
+}
+
+_ALIAS_MAP: dict[str, str] = {
+    "claude code": "Claude Code",
+    "cc": "Claude Code",
+    "claude": "Claude",
+    "chatgpt": "ChatGPT",
+    "gpt": "GPT",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "gemini": "Gemini",
+    "copilot": "Copilot",
+    "cursor": "Cursor",
+    "langchain": "LangChain",
+    "langgraph": "LangGraph",
+    "kubernetes": "Kubernetes",
+    "k8s": "Kubernetes",
+    "docker": "Docker",
+    "react": "React",
+}
+
+
+def _normalize_entity(etype: str, value: str) -> tuple[str, str] | None:
+    v_lower = value.lower().strip()
+    if v_lower in _STOP_ENTITIES or len(v_lower) < 2:
+        return None
+    if v_lower.startswith("@") or v_lower.startswith("http") or "@" in v_lower:
+        return None
+    if v_lower.isdigit():
+        return None
+    etype = _TYPE_OVERRIDES.get(v_lower, etype)
+    canonical = _ALIAS_MAP.get(v_lower, value.strip())
+    return etype, canonical
+
 
 _NLP = None
 
@@ -97,15 +261,19 @@ def _extract_spacy(
 
     for doc in nlp.pipe(texts, batch_size=256):
         entities: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[str] = set()
         for ent in doc.ents:
             etype = _SPACY_TO_ENTITY_TYPE.get(ent.label_)
             if not etype:
                 continue
             value = ent.text.strip()
-            if len(value) < 2 or value.lower() in sender_set:
+            if value.lower() in sender_set:
                 continue
-            key = (etype, value.lower())
+            normalized = _normalize_entity(etype, value)
+            if not normalized:
+                continue
+            etype, value = normalized
+            key = value.lower()
             if key in seen:
                 continue
             seen.add(key)
@@ -155,7 +323,12 @@ async def extract_entities(
         chat_jid = chat_jids[i]
 
         for etype, evalue in _extract_regex(text):
-            flat.append((msg_id, chat_jid, etype, evalue))
+            if etype == "url":
+                flat.append((msg_id, chat_jid, etype, evalue))
+            else:
+                normalized = _normalize_entity(etype, evalue)
+                if normalized:
+                    flat.append((msg_id, chat_jid, normalized[0], normalized[1]))
 
         for etype, evalue in spacy_results[i]:
             flat.append((msg_id, chat_jid, etype, evalue))
