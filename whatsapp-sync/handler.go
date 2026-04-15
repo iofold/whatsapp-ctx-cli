@@ -17,28 +17,37 @@ import (
 // EventHandler receives whatsmeow events, extracts message data, and persists
 // it via DuckStore.
 type EventHandler struct {
-	client        *whatsmeow.Client
-	store         *DuckStore
-	msgCount      atomic.Int64 // total messages processed
-	syncCount     atomic.Int64 // history sync events received
-	incremental   bool
-	highWatermark time.Time
-	done          chan struct{} // closed when history sync is considered complete
-	doneOnce      sync.Once     // ensures done is closed only once
-	idleTimer     *time.Timer   // reset on each HistorySync event
+	client    *whatsmeow.Client
+	store     *DuckStore
+	msgCount  atomic.Int64  // total messages processed
+	syncCount atomic.Int64  // history sync events received
+	done      chan struct{} // closed when history sync is considered complete
+	doneOnce  sync.Once     // ensures done is closed only once
+	idleTimer *time.Timer   // reset on each HistorySync event
+
+	initialIdleTimeout    time.Duration
+	historyIdleTimeout    time.Duration
+	terminalSettleTimeout time.Duration
 }
+
+const (
+	defaultInitialIdleTimeout    = 30 * time.Second
+	defaultHistoryIdleTimeout    = 10 * time.Minute
+	defaultTerminalSettleTimeout = 20 * time.Second
+)
 
 // NewEventHandler constructs an EventHandler wired to the given client and
 // store. Register its HandleEvent method with the whatsmeow client:
 //
 //	client.AddEventHandler(h.HandleEvent)
-func NewEventHandler(client *whatsmeow.Client, store *DuckStore, incremental bool, highWatermark time.Time) *EventHandler {
+func NewEventHandler(client *whatsmeow.Client, store *DuckStore) *EventHandler {
 	return &EventHandler{
-		client:        client,
-		store:         store,
-		incremental:   incremental,
-		highWatermark: highWatermark,
-		done:          make(chan struct{}),
+		client:                client,
+		store:                 store,
+		done:                  make(chan struct{}),
+		initialIdleTimeout:    defaultInitialIdleTimeout,
+		historyIdleTimeout:    defaultHistoryIdleTimeout,
+		terminalSettleTimeout: defaultTerminalSettleTimeout,
 	}
 }
 
@@ -52,10 +61,10 @@ func (h *EventHandler) HandleEvent(evt interface{}) {
 		h.handleMessage(v)
 	case *events.Connected:
 		log.Println("Connected to WhatsApp")
-		// Start idle timer on connect — if no HistorySync arrives within 30s,
+		// Start idle timer on connect — if no HistorySync arrives soon after connect,
 		// consider sync complete (e.g., incremental mode with no pending history).
 		if h.idleTimer == nil {
-			h.idleTimer = time.AfterFunc(30*time.Second, func() {
+			h.idleTimer = time.AfterFunc(h.initialIdleTimeout, func() {
 				log.Println("sync: no history sync events received, sync considered complete")
 				h.signalDone()
 			})
@@ -72,7 +81,15 @@ func (h *EventHandler) HandleEvent(evt interface{}) {
 func (h *EventHandler) handleHistorySync(evt *events.HistorySync) {
 	syncType := evt.Data.GetSyncType().String()
 	conversations := evt.Data.GetConversations()
-	log.Printf("History sync: type=%s conversations=%d", syncType, len(conversations))
+	progress := evt.Data.GetProgress()
+	chunk := evt.Data.GetChunkOrder()
+	log.Printf(
+		"History sync: type=%s chunk=%d progress=%d conversations=%d",
+		syncType,
+		chunk,
+		progress,
+		len(conversations),
+	)
 
 	var records []MessageRecord
 
@@ -115,23 +132,39 @@ func (h *EventHandler) handleHistorySync(evt *events.HistorySync) {
 
 	log.Printf("History sync: processed %d messages from %d conversations", len(records), len(conversations))
 
-	// Reset idle timer — if no more sync events in 60 seconds, we're done
+	// Reset idle timer.
+	// While history is still in flight, keep a long idle window to avoid
+	// disconnecting between sparse chunks. Once progress reaches 100, use a short
+	// settle timer so any trailing batches can still arrive before we finish.
 	if h.idleTimer != nil {
 		h.idleTimer.Stop()
 	}
-	h.idleTimer = time.AfterFunc(60*time.Second, func() {
-		log.Println("sync: no new history events for 60s, sync considered complete")
-		h.signalDone()
-	})
+	if progress >= 100 {
+		h.idleTimer = time.AfterFunc(h.terminalSettleTimeout, func() {
+			log.Printf(
+				"sync: history sync reached 100%% and stayed idle for %s, sync considered complete",
+				h.terminalSettleTimeout,
+			)
+			h.signalDone()
+		})
+	} else {
+		h.idleTimer = time.AfterFunc(h.historyIdleTimeout, func() {
+			log.Printf(
+				"sync: no new history events for %s after progress=%d, sync considered complete",
+				h.historyIdleTimeout,
+				progress,
+			)
+			h.signalDone()
+		})
+	}
 }
 
 // handleMessage processes a single live Message event.
+// We intentionally skip watermark filtering here — INSERT OR IGNORE on the
+// (id, chat_jid) primary key already handles deduplication. Filtering by a
+// global watermark caused messages in less-active chats (e.g. groups) to be
+// silently dropped when other chats had newer timestamps.
 func (h *EventHandler) handleMessage(evt *events.Message) {
-	if h.incremental &&
-		(evt.Info.Timestamp.Before(h.highWatermark) || evt.Info.Timestamp.Equal(h.highWatermark)) {
-		return
-	}
-
 	record := extractMessage(evt)
 
 	if err := h.store.InsertMessages([]MessageRecord{record}); err != nil {

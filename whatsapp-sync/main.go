@@ -56,10 +56,9 @@ Run "whatsapp-sync <command> --help" for command-specific flags.
 `)
 }
 
-// connectWhatsApp creates and connects a whatsmeow client. If showQR is true
-// and no session exists yet, it runs the QR login flow; otherwise it connects
-// directly with the existing session.
-func connectWhatsApp(ctx context.Context, waDBPath string, showQR bool) (*whatsmeow.Client, error) {
+// newWhatsAppClient creates a whatsmeow client backed by the given SQLite
+// session store. Call connectWhatsApp after registering any event handlers.
+func newWhatsAppClient(ctx context.Context, waDBPath string) (*whatsmeow.Client, error) {
 	dbLog := waLog.Stdout("DB", "ERROR", true)
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+waDBPath+"?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -73,16 +72,22 @@ func connectWhatsApp(ctx context.Context, waDBPath string, showQR bool) (*whatsm
 
 	clientLog := waLog.Stdout("Client", "ERROR", true)
 	client := whatsmeow.NewClient(device, clientLog)
+	return client, nil
+}
 
+// connectWhatsApp connects an existing whatsmeow client. If showQR is true and
+// no session exists yet, it runs the QR login flow; otherwise it connects
+// directly with the existing session.
+func connectWhatsApp(ctx context.Context, client *whatsmeow.Client, showQR bool) error {
 	if showQR && client.Store.ID == nil {
 		// Not logged in — run QR login flow.
 		qrChan, err := client.GetQRChannel(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get QR channel: %w", err)
+			return fmt.Errorf("failed to get QR channel: %w", err)
 		}
 
 		if err := client.Connect(); err != nil {
-			return nil, fmt.Errorf("failed to connect: %w", err)
+			return fmt.Errorf("failed to connect: %w", err)
 		}
 
 		for evt := range qrChan {
@@ -95,11 +100,11 @@ func connectWhatsApp(ctx context.Context, waDBPath string, showQR bool) (*whatsm
 	} else {
 		// Already logged in (or QR not requested) — connect directly.
 		if err := client.Connect(); err != nil {
-			return nil, fmt.Errorf("failed to connect: %w", err)
+			return fmt.Errorf("failed to connect: %w", err)
 		}
 	}
 
-	return client, nil
+	return nil
 }
 
 func runSyncCmd(args []string) {
@@ -147,21 +152,26 @@ func runSyncCmd(args []string) {
 	if *incremental {
 		wm, err := duckStore.GetHighWatermark()
 		if err != nil {
-			log.Printf("Failed to get high watermark (starting from beginning): %v", err)
+			log.Printf("Failed to get latest stored timestamp: %v", err)
 		} else {
 			watermark = wm
-			log.Printf("Incremental sync from watermark: %s", watermark.Format(time.RFC3339))
+			if !watermark.IsZero() {
+				log.Printf("Incremental sync with overlap protection: existing data through %s (duplicates ignored)", watermark.Format(time.RFC3339))
+			}
 		}
 	}
 
-	client, err := connectWhatsApp(ctx, *waDBPath, true)
+	client, err := newWhatsAppClient(ctx, *waDBPath)
 	if err != nil {
+		log.Fatalf("Failed to create WhatsApp client: %v", err)
+	}
+
+	handler := NewEventHandler(client, duckStore)
+	client.AddEventHandler(handler.HandleEvent)
+	if err := connectWhatsApp(ctx, client, true); err != nil {
 		log.Fatalf("Failed to connect to WhatsApp: %v", err)
 	}
 	defer client.Disconnect()
-
-	handler := NewEventHandler(client, duckStore, *incremental, watermark)
-	client.AddEventHandler(handler.HandleEvent)
 
 	// Set up signal handler for graceful shutdown.
 	quit := make(chan os.Signal, 1)
@@ -259,8 +269,11 @@ func runDownloadCmd(args []string) {
 
 	ctx := context.Background()
 
-	client, err := connectWhatsApp(ctx, *waDBPath, false)
+	client, err := newWhatsAppClient(ctx, *waDBPath)
 	if err != nil {
+		log.Fatalf("Failed to create WhatsApp client: %v", err)
+	}
+	if err := connectWhatsApp(ctx, client, false); err != nil {
 		log.Fatalf("Failed to connect to WhatsApp: %v", err)
 	}
 	defer client.Disconnect()
