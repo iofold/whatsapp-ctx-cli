@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import platform
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -40,18 +39,9 @@ def find_binary(config: Config) -> Path | None:
     candidates = [
         _PACKAGE_BIN / "whatsapp-sync",
         _PACKAGE_BIN / _platform_binary_name(),
+        Path.cwd() / "whatsapp-sync",
+        Path.home() / ".local" / "bin" / "whatsapp-sync",
     ]
-
-    found = shutil.which("whatsapp-sync")
-    if found:
-        candidates.insert(0, Path(found))
-
-    candidates.extend(
-        [
-            Path.cwd() / "whatsapp-sync",
-            Path.home() / ".local" / "bin" / "whatsapp-sync",
-        ]
-    )
 
     for c in candidates:
         if c.is_file() and os.access(c, os.X_OK):
