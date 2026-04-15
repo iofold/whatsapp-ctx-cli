@@ -7,7 +7,16 @@ build/
 .venv/
 *.duckdb
 *.duckdb.wal
+*.db
+*.sqlite
+*.sqlite3
 .tmp/
 .env
+*.pem
+*.key
 wactx/bin/
 !wactx/bin/.gitkeep
+.sisyphus/
+docs/progress_log.ndjson
+whatsapp-sync/whatsapp-sync
+config.toml
