@@ -146,7 +146,6 @@ _STOP_ENTITIES: set[str] = {
     "bengaluru",
     "gurgaon",
     "noida",
-    "chennai",
     "kolkata",
     "jaipur",
     "chandigarh",
@@ -181,7 +180,6 @@ _TYPE_OVERRIDES: dict[str, str] = {
     "mcp": "tech",
     "aws": "tech",
     "github": "tech",
-    "linkedin": "tech",
     "phd": "org",
 }
 

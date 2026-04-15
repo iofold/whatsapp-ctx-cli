@@ -65,6 +65,23 @@ wactx search "hiring ML engineers" --json
 wactx search "investors" --json | jq '.people[:5]'
 ```
 
+### Filters
+
+Narrow results with literal-keyword, chat, and time-range filters. Filters apply to BM25, semantic, and graph-expansion passes in one place.
+
+```bash
+wactx search "expert" -k Kubernetes                  # must contain "Kubernetes"
+wactx search "expert" -k Kubernetes -k Google        # must contain BOTH (AND)
+wactx search "advice" --chat "Founders Chat"         # substring-match chat name
+wactx search "advice" --chat 120363@g.us             # or a JID directly
+wactx search "kubernetes" --after 2026-01-01 --before 2026-03-31
+wactx search "production" -k Docker --chat "Founders" --after 2026-01-01
+```
+
+- `-k, --keyword TEXT` — repeatable; each one is a required case-insensitive substring (AND).
+- `--chat TEXT` — either a JID (`...@g.us` / `...@s.whatsapp.net`) or a case-insensitive substring matched against contact/group names. Fails fast with a clear error if nothing matches.
+- `--after YYYY-MM-DD` / `--before YYYY-MM-DD` — inclusive date range on the message timestamp. `--before 2026-03-31` includes all of March 31.
+
 Search returns two ranked lists:
 
 - **People**: Scored by semantic similarity and graph proximity. This includes DMs, shared groups, and co-mentioned entities.
@@ -146,18 +163,20 @@ wactx config api.embedding_model nomic-embed-text
 | `wactx index [--reset]` | Embed messages for semantic search |
 | `wactx enrich [--all]` | Extract entities from messages |
 | `wactx graph` | Build relationship graph |
-| `wactx search QUERY` | Semantic and graph search |
-| `wactx stats` | Show database statistics |
+| `wactx search QUERY [-k KW] [--chat ...] [--after D] [--before D] [--json]` | Semantic and graph search, with optional filters |
+| `wactx stats [--json]` | Show database statistics |
 
 ## Agent Integration
 
-Copy the skill to your Claude Code skills directory:
+`wactx` is built to be agent-friendly: JSON output on `search` and `stats`, non-zero exit codes on error, structured filters, and no interactive prompts on any read-only command. A bundled skill teaches Claude Code how to drive it.
 
 ```bash
-cp -r skills/wactx ~/.claude/skills/
+cp -r skills/wactx ~/.claude/skills/      # global install
 ```
 
-Claude will automatically use `wactx search` when you ask about contacts, conversations, or relationships.
+Or, if you only want the skill inside this repo, Claude Code picks up `skills/wactx/SKILL.md` automatically when you run it from the project root.
+
+Once installed, Claude will call `wactx search --json` (with the right filters) whenever you ask about contacts, conversations, or relationships. See `skills/wactx/SKILL.md` for the full contract — input flags, JSON schema, exit codes, and common recipes.
 
 ## Architecture
 

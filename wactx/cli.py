@@ -39,7 +39,7 @@ def cli(ctx, config_path, verbose):
 
 
 GITHUB_RELEASE_URL = (
-    "https://github.com/your-org/whatsapp-ctx-cli/releases/latest/download"
+    "https://github.com/iofold/whatsapp-ctx-cli/releases/latest/download"
 )
 
 
@@ -365,27 +365,69 @@ def graph(ctx):
     default=None,
     help="Graph expansion iterations (default: from depth preset)",
 )
+@click.option(
+    "-k",
+    "--keyword",
+    "keywords",
+    multiple=True,
+    help="Require messages to contain this literal substring (repeatable; AND semantics)",
+)
+@click.option(
+    "--chat",
+    default=None,
+    help="Filter by chat JID or case-insensitive substring of group/contact name",
+)
+@click.option("--after", default=None, help="Only messages on/after this date (YYYY-MM-DD)")
+@click.option("--before", default=None, help="Only messages on/before this date (YYYY-MM-DD)")
 @click.option("--json", "output_json", is_flag=True)
 @click.pass_context
-def search(ctx, query, depth, variants, top, no_graph, iterations, output_json):
-    """Search messages with semantic + graph search."""
+def search(
+    ctx, query, depth, variants, top, no_graph, iterations,
+    keywords, chat, after, before, output_json,
+):
+    """Search messages with semantic + graph search.
+
+    Use -k/--keyword to require literal substrings, --chat to scope to a
+    specific chat (name substring or JID), and --after/--before for a
+    date range (YYYY-MM-DD).
+    """
+    from datetime import datetime
+
     from wactx.search import run_search
     from wactx.db import get_connection
+
+    for label, value in (("--after", after), ("--before", before)):
+        if value is None:
+            continue
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            raise click.BadParameter(
+                f"{label} must be YYYY-MM-DD, got {value!r}", param_hint=label
+            )
 
     cfg = ctx.obj["config"]
     depth = depth or cfg.search.default_depth
     conn = get_connection(cfg, read_only=True)
 
-    data = run_search(
-        conn,
-        cfg,
-        query,
-        depth=depth,
-        variants=variants,
-        top=top,
-        no_graph=no_graph,
-        iterations=iterations,
-    )
+    try:
+        data = run_search(
+            conn,
+            cfg,
+            query,
+            depth=depth,
+            variants=variants,
+            top=top,
+            no_graph=no_graph,
+            iterations=iterations,
+            keywords=list(keywords) if keywords else None,
+            chat=chat,
+            after=after,
+            before=before,
+        )
+    except ValueError as e:
+        conn.close()
+        raise click.ClickException(str(e))
 
     if output_json:
         conn.close()
@@ -395,6 +437,7 @@ def search(ctx, query, depth, variants, top, no_graph, iterations, output_json):
             "elapsed_s": round(data["elapsed"], 2),
             "queries_used": data["queries_used"],
             "progress": data.get("progress", []),
+            "filters": data.get("filters", {}),
             "people": [
                 {
                     "name": p["display_name"],
@@ -436,22 +479,29 @@ def search(ctx, query, depth, variants, top, no_graph, iterations, output_json):
 
 
 @cli.command()
+@click.option("--json", "output_json", is_flag=True, help="Emit counts as JSON")
 @click.pass_context
-def stats(ctx):
+def stats(ctx, output_json):
     """Show database statistics."""
     from wactx.db import get_connection, get_table_counts
     from wactx.render import render_stats
 
     cfg = ctx.obj["config"]
     if not cfg.db_path.exists():
-        click.echo("No database found. Run 'wactx init' first.")
-        return
+        if output_json:
+            click.echo(json.dumps({"error": "no_database", "hint": "Run 'wactx init' first."}))
+        else:
+            click.echo("No database found. Run 'wactx init' first.")
+        ctx.exit(1)
 
     conn = get_connection(cfg, read_only=True)
     counts = get_table_counts(conn)
     conn.close()
 
-    render_stats(counts)
+    if output_json:
+        click.echo(json.dumps({"db_path": str(cfg.db_path), "tables": counts}, indent=2))
+    else:
+        render_stats(counts)
 
 
 @cli.command()

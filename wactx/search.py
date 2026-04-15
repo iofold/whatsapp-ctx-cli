@@ -73,18 +73,90 @@ def embed_queries(
     return [e.embedding for e in resp.data]
 
 
-def bm25_search(conn: duckdb.DuckDBPyConnection, query: str, top_k: int) -> list[dict]:
+def _build_filter_clauses(
+    keywords: list[str] | None,
+    chat_jids: list[str] | None,
+    after: str | None,
+    before: str | None,
+    *,
+    col_prefix: str = "",
+) -> tuple[list[str], list]:
+    """Build parameterized SQL WHERE fragments for search filters.
+
+    col_prefix is a column qualifier like "m." (or empty for unqualified).
+    Returns (clauses, params).
+    """
+    clauses: list[str] = []
+    params: list = []
+    p = col_prefix
+    for kw in keywords or []:
+        clauses.append(f"{p}text_content ILIKE ?")
+        params.append(f"%{kw}%")
+    if chat_jids:
+        placeholders = ", ".join(["?"] * len(chat_jids))
+        clauses.append(f"{p}chat_jid IN ({placeholders})")
+        params.extend(chat_jids)
+    if after:
+        clauses.append(f"{p}timestamp >= ?::TIMESTAMPTZ")
+        params.append(after)
+    if before:
+        clauses.append(f"{p}timestamp < (?::TIMESTAMPTZ + INTERVAL '1 day')")
+        params.append(before)
+    return clauses, params
+
+
+def resolve_chat_filter(
+    conn: duckdb.DuckDBPyConnection, chat_arg: str | None
+) -> list[str]:
+    """Resolve a user-supplied chat argument to a list of JIDs.
+
+    Accepts a literal JID (contains '@') or a case-insensitive substring
+    match against group names / push names / full names in the contacts table.
+    Returns [] when chat_arg is falsy. Raises ValueError if no match found.
+    """
+    if not chat_arg:
+        return []
+    if "@" in chat_arg:
+        return [chat_arg]
+    like = f"%{chat_arg}%"
     try:
         rows = conn.execute(
-            """SELECT m.id, m.text_content, m.push_name, m.sender_jid, m.chat_jid,
-                      m.timestamp, m.media_type, m.media_path,
-                      fts_main_messages.match_bm25(m.id, ?, fields := 'text_content') AS score
-               FROM messages m
-               WHERE score IS NOT NULL
-               ORDER BY score
-               LIMIT ?""",
-            [query, top_k],
+            """SELECT jid FROM contacts
+               WHERE (is_group = true  AND group_name ILIKE ?)
+                  OR (is_group = false AND (push_name ILIKE ? OR full_name ILIKE ?))""",
+            [like, like, like],
         ).fetchall()
+    except Exception:
+        rows = []
+    jids = [r[0] for r in rows]
+    if not jids:
+        raise ValueError(f"No chats match: {chat_arg!r}")
+    return jids
+
+
+def bm25_search(
+    conn: duckdb.DuckDBPyConnection,
+    query: str,
+    top_k: int,
+    *,
+    keywords: list[str] | None = None,
+    chat_jids: list[str] | None = None,
+    after: str | None = None,
+    before: str | None = None,
+) -> list[dict]:
+    filter_clauses, filter_params = _build_filter_clauses(
+        keywords, chat_jids, after, before, col_prefix="m."
+    )
+    where = " AND ".join(["score IS NOT NULL", *filter_clauses])
+    sql = f"""SELECT m.id, m.text_content, m.push_name, m.sender_jid, m.chat_jid,
+                     m.timestamp, m.media_type, m.media_path,
+                     fts_main_messages.match_bm25(m.id, ?, fields := 'text_content') AS score
+              FROM messages m
+              WHERE {where}
+              ORDER BY score DESC
+              LIMIT ?"""
+    try:
+        rows = conn.execute(sql, [query, *filter_params, top_k]).fetchall()
     except Exception:
         return []
 
@@ -105,18 +177,28 @@ def bm25_search(conn: duckdb.DuckDBPyConnection, query: str, top_k: int) -> list
 
 
 def semantic_search(
-    conn: duckdb.DuckDBPyConnection, vectors: list[list[float]], dims: int, top_k: int
+    conn: duckdb.DuckDBPyConnection,
+    vectors: list[list[float]],
+    dims: int,
+    top_k: int,
+    *,
+    keywords: list[str] | None = None,
+    chat_jids: list[str] | None = None,
+    after: str | None = None,
+    before: str | None = None,
 ) -> list[dict]:
+    filter_clauses, filter_params = _build_filter_clauses(
+        keywords, chat_jids, after, before
+    )
+    where = " AND ".join(["embedding IS NOT NULL", *filter_clauses])
+    sql = f"""SELECT id, text_content, push_name, sender_jid, chat_jid, timestamp,
+                    media_type, media_path,
+                    array_cosine_similarity(embedding, ?::FLOAT[{dims}]) AS similarity
+             FROM messages WHERE {where}
+             ORDER BY similarity DESC LIMIT ?"""
     all_results: dict[str, dict] = {}
     for qvec in vectors:
-        rows = conn.execute(
-            f"""SELECT id, text_content, push_name, sender_jid, chat_jid, timestamp,
-                       media_type, media_path,
-                       array_cosine_similarity(embedding, ?::FLOAT[{dims}]) AS similarity
-                FROM messages WHERE embedding IS NOT NULL
-                ORDER BY similarity DESC LIMIT ?""",
-            [qvec, top_k],
-        ).fetchall()
+        rows = conn.execute(sql, [qvec, *filter_params, top_k]).fetchall()
         for r in rows:
             mid, sim = r[0], float(r[8])
             if mid not in all_results or sim > all_results[mid]["similarity"]:
@@ -483,6 +565,10 @@ def run_search(
     no_graph: bool = False,
     iterations: int | None = None,
     output_json: bool = False,
+    keywords: list[str] | None = None,
+    chat: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
 ) -> dict:
     import click
 
@@ -491,6 +577,12 @@ def run_search(
     top_k = top if top is not None else preset["top"]
     use_graph = preset["graph"] and not no_graph
     n_iterations = iterations if iterations is not None else preset.get("iterations", 1)
+
+    keywords = list(keywords) if keywords else []
+    chat_jids = resolve_chat_filter(conn, chat) if chat else None
+    filter_kwargs = dict(
+        keywords=keywords, chat_jids=chat_jids, after=after, before=before
+    )
 
     ctx = click.get_current_context(silent=True)
     if ctx is not None:
@@ -516,8 +608,8 @@ def run_search(
     dims = config.api.embedding_dims
     progress.append({"label": f"Query → {len(queries)} variants"})
 
-    bm25_results = bm25_search(conn, query, top_k=top_k * 3)
-    vector_results = semantic_search(conn, vectors, dims, top_k * 3)
+    bm25_results = bm25_search(conn, query, top_k=top_k * 3, **filter_kwargs)
+    vector_results = semantic_search(conn, vectors, dims, top_k * 3, **filter_kwargs)
 
     if bm25_results:
         candidates = rrf_fuse([("bm25", bm25_results), ("vector", vector_results)])
@@ -569,6 +661,10 @@ def run_search(
             # Fetch messages from PPR-ranked people via vector search
             expanded = []
             ppr_placeholders = ", ".join(["?"] * len(ppr_jids))
+            expand_clauses, expand_params = _build_filter_clauses(
+                keywords, chat_jids, after, before
+            )
+            extra_where = (" AND " + " AND ".join(expand_clauses)) if expand_clauses else ""
             for qvec in vectors[:2]:
                 try:
                     rows = conn.execute(
@@ -577,9 +673,9 @@ def run_search(
                                    array_cosine_similarity(embedding, ?::FLOAT[{dims}]) AS similarity
                             FROM messages
                             WHERE embedding IS NOT NULL
-                              AND sender_jid IN ({ppr_placeholders})
+                              AND sender_jid IN ({ppr_placeholders}){extra_where}
                             ORDER BY similarity DESC LIMIT ?""",
-                        [qvec] + ppr_jids + [top_k * 2],
+                        [qvec, *ppr_jids, *expand_params, top_k * 2],
                     ).fetchall()
                 except Exception:
                     continue
@@ -671,4 +767,11 @@ def run_search(
         "people": people,
         "messages": candidates[:top_k],
         "insights": insights,
+        "filters": {
+            "keywords": keywords,
+            "chat": chat,
+            "chat_jids": chat_jids,
+            "after": after,
+            "before": before,
+        },
     }

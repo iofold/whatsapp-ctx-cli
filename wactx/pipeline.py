@@ -11,35 +11,28 @@ from wactx.config import Config
 log = logging.getLogger("wactx.pipeline")
 
 
-async def _run_parallel_processing(config: Config) -> tuple[int, int]:
+async def _run_processing(config: Config) -> tuple[int, int]:
     from wactx.embed import run_pipeline
     from wactx.entities import extract_entities
     from wactx.db import get_connection
 
-    conn = get_connection(config)
-
-    index_task = asyncio.create_task(run_pipeline(config))
-    enrich_task = asyncio.create_task(extract_entities(conn, config, process_all=False))
-
-    index_result, enrich_result = await asyncio.gather(
-        index_task, enrich_task, return_exceptions=True
-    )
-
-    conn.close()
-
     embedded = 0
+    try:
+        result = await run_pipeline(config)
+        embedded = int(result or 0)
+    except Exception as e:
+        log.warning("Indexing failed: %s", e)
+
     entities = 0
-    if isinstance(index_result, BaseException):
-        log.warning("Indexing failed: %s", index_result)
-    else:
-        embedded = index_result or 0
+    conn = get_connection(config)
+    try:
+        entities = int(await extract_entities(conn, config, process_all=False) or 0)
+    except Exception as e:
+        log.warning("Entity extraction failed: %s", e)
+    finally:
+        conn.close()
 
-    if isinstance(enrich_result, BaseException):
-        log.warning("Entity extraction failed: %s", enrich_result)
-    else:
-        entities = enrich_result or 0
-
-    return int(embedded), int(entities)
+    return embedded, entities
 
 
 def run_post_sync(config: Config) -> None:
@@ -48,8 +41,8 @@ def run_post_sync(config: Config) -> None:
     click.echo()
     click.secho("Post-sync processing...", bold=True)
 
-    click.echo("  Indexing messages + extracting entities (parallel)...")
-    embedded, entities = asyncio.run(_run_parallel_processing(config))
+    click.echo("  Indexing messages + extracting entities...")
+    embedded, entities = asyncio.run(_run_processing(config))
     click.secho(
         f"  ✓ Indexed {embedded} messages, extracted {entities} entity mentions",
         fg="green",

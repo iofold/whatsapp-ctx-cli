@@ -107,8 +107,8 @@ async def embed_texts(
             m.text_content,
             m.chat_jid,
             m.timestamp,
-            (SELECT STRING_AGG(m2.push_name || ': ' || m2.text_content, chr(10)
-                ORDER BY m2.timestamp ASC)
+            (SELECT STRING_AGG(push_name || ': ' || text_content, chr(10)
+                ORDER BY timestamp ASC)
              FROM (
                 SELECT push_name, text_content, timestamp
                 FROM messages m2
@@ -118,11 +118,11 @@ async def embed_texts(
                   AND m2.text_content IS NOT NULL
                   AND TRIM(m2.text_content) != ''
                 ORDER BY m2.timestamp DESC
-                LIMIT 1
-             ) m2
+                LIMIT 3
+             ) t
             ) AS context_before,
-            (SELECT STRING_AGG(m2.push_name || ': ' || m2.text_content, chr(10)
-                ORDER BY m2.timestamp ASC)
+            (SELECT STRING_AGG(push_name || ': ' || text_content, chr(10)
+                ORDER BY timestamp ASC)
              FROM (
                 SELECT push_name, text_content, timestamp
                 FROM messages m2
@@ -132,8 +132,8 @@ async def embed_texts(
                   AND m2.text_content IS NOT NULL
                   AND TRIM(m2.text_content) != ''
                 ORDER BY m2.timestamp ASC
-                LIMIT 1
-             ) m2
+                LIMIT 3
+             ) t
             ) AS context_after
         FROM messages m
         WHERE m.embedding IS NULL

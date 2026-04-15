@@ -62,7 +62,6 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             raw_proto BLOB,
             media_downloaded BOOLEAN DEFAULT FALSE,
             media_path VARCHAR,
-            embedding FLOAT[768],
             PRIMARY KEY (id, chat_jid)
         )
         """
