@@ -10,8 +10,14 @@ import duckdb
 from openai import OpenAI
 
 from wactx.config import Config
+from wactx.db import FTS_SCHEMA, fts_doc_key
 
 log = logging.getLogger("wactx.search")
+
+# HNSW candidate-list size for unfiltered vector search. Measured 2026-09-28 on 176k
+# vectors: recall@90 vs exact 0.915 at the default, 0.99 (worst query 0.93) at 1000,
+# ~75 ms either way against ~340 ms for an exact scan.
+HNSW_EF_SEARCH = 1000
 
 DEPTH_PRESETS = {
     "fast": {"variants": 1, "top": 10, "graph": False, "iterations": 1},
@@ -150,14 +156,15 @@ def bm25_search(
     where = " AND ".join(["score IS NOT NULL", *filter_clauses])
     sql = f"""SELECT m.id, m.text_content, m.push_name, m.sender_jid, m.chat_jid,
                      m.timestamp, m.media_type, m.media_path,
-                     fts_main_messages.match_bm25(m.id, ?, fields := 'text_content') AS score
+                     {FTS_SCHEMA}.match_bm25({fts_doc_key('m.')}, ?, fields := 'text_content') AS score
               FROM messages m
               WHERE {where}
               ORDER BY score DESC
               LIMIT ?"""
     try:
         rows = conn.execute(sql, [query, *filter_params, top_k]).fetchall()
-    except Exception:
+    except Exception as e:
+        log.warning("Keyword (BM25) search failed; continuing with vector results only: %s", e)
         return []
 
     return [
@@ -190,20 +197,36 @@ def semantic_search(
     filter_clauses, filter_params = _build_filter_clauses(
         keywords, chat_jids, after, before
     )
-    where = " AND ".join(["embedding IS NOT NULL", *filter_clauses])
-    sql = f"""SELECT id, text_content, push_name, sender_jid, chat_jid, timestamp,
-                    media_type, media_path,
-                    array_cosine_similarity(embedding, ?::FLOAT[{dims}]) AS similarity
-             FROM messages WHERE {where}
-             ORDER BY similarity DESC LIMIT ?"""
-    all_results: dict[str, dict] = {}
+    columns = "id, text_content, push_name, sender_jid, chat_jid, timestamp, media_type, media_path"
+    if filter_clauses:
+        # Exact scan: the HNSW index applies WHERE filters only after picking its
+        # candidates, so a filtered index search can return far fewer rows (a chat filter
+        # returned 0 of 60 in testing).
+        where = " AND ".join(["embedding IS NOT NULL", *filter_clauses])
+        sql = f"""SELECT {columns},
+                         array_cosine_similarity(embedding, ?::FLOAT[{dims}]) AS similarity
+                  FROM messages WHERE {where}
+                  ORDER BY similarity DESC LIMIT ?"""
+    else:
+        # Served by the HNSW index (metric 'cosine') only in this exact shape: ORDER BY the
+        # distance alias, LIMIT. Repeating the distance expression in the SELECT list makes
+        # the planner fall back to a full scan. Without the index this is an exact scan.
+        _set_hnsw_ef_search(conn)
+        sql = f"""SELECT {columns},
+                         array_cosine_distance(embedding, ?::FLOAT[{dims}]) AS distance
+                  FROM messages
+                  ORDER BY distance LIMIT ?"""
+    all_results: dict[tuple[str, str], dict] = {}
     for qvec in vectors:
         rows = conn.execute(sql, [qvec, *filter_params, top_k]).fetchall()
         for r in rows:
-            mid, sim = r[0], float(r[8])
-            if mid not in all_results or sim > all_results[mid]["similarity"]:
-                all_results[mid] = {
-                    "id": mid,
+            if r[8] is None:
+                continue
+            key = (r[0], r[4])
+            sim = float(r[8]) if filter_clauses else 1.0 - float(r[8])
+            if key not in all_results or sim > all_results[key]["similarity"]:
+                all_results[key] = {
+                    "id": r[0],
                     "text": r[1],
                     "sender": r[2],
                     "sender_jid": r[3],
@@ -218,12 +241,24 @@ def semantic_search(
     ]
 
 
+def _set_hnsw_ef_search(conn: duckdb.DuckDBPyConnection) -> None:
+    try:
+        conn.execute(f"SET hnsw_ef_search = {HNSW_EF_SEARCH}")
+    except Exception as e:
+        log.debug("hnsw_ef_search unavailable (vss not loaded?): %s", e)
+
+
+def message_key(doc: dict) -> tuple[str, str]:
+    """Messages are unique by (id, chat_jid); ids alone repeat across chats."""
+    return doc["id"], doc["chat_jid"]
+
+
 def rrf_fuse(rankings: list[tuple[str, list[dict]]], k: int = 60) -> list[dict]:
-    scores: dict[str, float] = defaultdict(float)
-    docs: dict[str, dict] = {}
+    scores: dict[tuple[str, str], float] = defaultdict(float)
+    docs: dict[tuple[str, str], dict] = {}
     for _name, results in rankings:
         for rank, doc in enumerate(results):
-            doc_id = doc["id"]
+            doc_id = message_key(doc)
             scores[doc_id] += 1.0 / (k + rank + 1)
             if doc_id not in docs:
                 docs[doc_id] = doc
@@ -701,8 +736,8 @@ def run_search(
                 seen = set()
                 unique_expanded = []
                 for doc in sorted(expanded, key=lambda x: -x["similarity"]):
-                    if doc["id"] not in seen:
-                        seen.add(doc["id"])
+                    if message_key(doc) not in seen:
+                        seen.add(message_key(doc))
                         unique_expanded.append(doc)
                 candidates = rrf_fuse(
                     [

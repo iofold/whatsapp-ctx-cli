@@ -124,19 +124,62 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
     ensure_fts_index(conn)
 
 
+FTS_DOC_TABLE = "messages_fts_doc"
+FTS_SCHEMA = f"fts_main_{FTS_DOC_TABLE}"
+
+
+def fts_doc_key(prefix: str = "") -> str:
+    """SQL for a message's full-text document key; `prefix` qualifies columns, e.g. "m."."""
+    return f"{prefix}id || '|' || {prefix}chat_jid"
+
+
 def ensure_fts_index(conn: duckdb.DuckDBPyConnection) -> None:
+    """Build the BM25 index over `messages` when it is missing or behind.
+
+    DuckDB FTS needs a unique document id, and message ids repeat across chats (7,989 on
+    2026-09-28), so an index keyed on `messages.id` made every match_bm25 call fail. The
+    index is built over a side table keyed by id|chat_jid instead.
+    """
     try:
         conn.execute("INSTALL fts")
         conn.execute("LOAD fts")
     except Exception:
         pass
+    log = logging.getLogger("wactx.db")
     try:
+        eligible = conn.execute(
+            "SELECT count(*) FROM messages WHERE text_content IS NOT NULL AND trim(text_content) <> ''"
+        ).fetchone()
+        indexed = None
+        if _fts_index_exists(conn):
+            indexed = conn.execute(f"SELECT count(*) FROM {FTS_DOC_TABLE}").fetchone()
+        if eligible and indexed and eligible[0] == indexed[0]:
+            return
         conn.execute(
-            "PRAGMA create_fts_index('messages', 'id', 'text_content', "
+            f"CREATE OR REPLACE TABLE {FTS_DOC_TABLE} AS "
+            f"SELECT {fts_doc_key()} AS doc_key, text_content FROM messages "
+            "WHERE text_content IS NOT NULL AND trim(text_content) <> ''"
+        )
+        conn.execute(
+            f"PRAGMA create_fts_index('{FTS_DOC_TABLE}', 'doc_key', 'text_content', "
             "stemmer='english', stopwords='english', overwrite=1)"
         )
+        if _schema_has_table(conn, "fts_main_messages", "docs"):
+            conn.execute("PRAGMA drop_fts_index('messages')")
     except Exception as e:
-        logging.getLogger("wactx.db").warning("FTS index creation failed: %s", e)
+        log.warning("FTS index creation failed: %s", e)
+
+
+def _fts_index_exists(conn: duckdb.DuckDBPyConnection) -> bool:
+    return table_exists(conn, FTS_DOC_TABLE) and _schema_has_table(conn, FTS_SCHEMA, "docs")
+
+
+def _schema_has_table(conn: duckdb.DuckDBPyConnection, schema: str, table: str) -> bool:
+    row = conn.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE schema_name = ? AND table_name = ?",
+        [schema, table],
+    ).fetchone()
+    return bool(row and row[0])
 
 
 def table_exists(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:
