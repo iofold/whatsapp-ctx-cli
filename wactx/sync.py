@@ -100,12 +100,42 @@ def sync_whatsapp(config: Config, incremental: bool = True, live: bool = False) 
     if not Path(_resolve_wa_db(config)).exists():
         log.info("First run — scan the QR code with WhatsApp on your phone.")
 
+    index_suspended = _suspend_embedding_index(config)
     try:
         proc = subprocess.run(cmd, check=False)
         if proc.returncode != 0:
             log.error("Sync exited with code %d", proc.returncode)
     except KeyboardInterrupt:
         log.info("Sync interrupted")
+    finally:
+        if index_suspended:
+            _restore_embedding_index(config)
+
+
+def _suspend_embedding_index(config: Config) -> bool:
+    """Drop the HNSW index while the Go binary inserts messages (see embed.drop_hnsw_index)."""
+    if not Path(config.db_path).exists():
+        return False
+    from wactx.db import get_connection
+    from wactx.embed import drop_hnsw_index
+
+    conn = get_connection(config)
+    try:
+        return drop_hnsw_index(conn)
+    finally:
+        conn.close()
+
+
+def _restore_embedding_index(config: Config) -> None:
+    from wactx.db import get_connection
+    from wactx.embed import create_hnsw_index
+
+    log.info("Rebuilding the message vector index...")
+    conn = get_connection(config)
+    try:
+        create_hnsw_index(conn)
+    finally:
+        conn.close()
 
 
 def download_media(

@@ -15,6 +15,7 @@ log = logging.getLogger("wactx.embed")
 
 BATCH_SIZE = 100
 MAX_TEXT_CHARS = 8000
+HNSW_INDEX_NAME = "idx_msg_embedding"
 
 
 def ensure_embedding_column(conn: duckdb.DuckDBPyConnection, dims: int) -> None:
@@ -35,11 +36,29 @@ def ensure_embedding_column(conn: duckdb.DuckDBPyConnection, dims: int) -> None:
         conn.execute(f"ALTER TABLE messages ADD COLUMN embedding FLOAT[{dims}]")
 
 
+def drop_hnsw_index(conn: duckdb.DuckDBPyConnection) -> bool:
+    """Drop the persisted HNSW index before rows in `messages` are inserted or re-embedded.
+
+    With the index in place, every checkpoint after such a write stores a full new copy of
+    the index and never frees the previous one (~300 MB per checkpoint at 176k vectors; the
+    DB reached 43 GB around 0.6 GB of data). Dropping the index releases all of those
+    blocks, and create_hnsw_index() rebuilds it once the writes are done.
+    Returns True if an index was dropped.
+    """
+    exists = conn.execute(
+        "SELECT count(*) FROM duckdb_indexes() WHERE index_name = ?", [HNSW_INDEX_NAME]
+    ).fetchone()
+    if not exists or exists[0] == 0:
+        return False
+    conn.execute(f"DROP INDEX {HNSW_INDEX_NAME}")
+    return True
+
+
 def create_hnsw_index(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("SET hnsw_enable_experimental_persistence = true")
     try:
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_msg_embedding "
+            f"CREATE INDEX IF NOT EXISTS {HNSW_INDEX_NAME} "
             "ON messages USING HNSW (embedding) WITH (metric = 'cosine')"
         )
         log.info("HNSW index created")
@@ -98,6 +117,9 @@ async def embed_texts(
     if remaining == 0:
         log.info("All messages already embedded")
         return 0
+
+    # run_pipeline() rebuilds the index after the embedding UPDATEs below.
+    drop_hnsw_index(conn)
 
     log.info("Embedding %d messages...", remaining)
     rows = conn.execute(
@@ -224,7 +246,9 @@ async def run_pipeline(config: Config, reset: bool = False) -> None:
     conn = get_connection(config)
     try:
         ensure_embedding_column(conn, config.api.embedding_dims)
-        await embed_texts(conn, config, reset)
-        create_hnsw_index(conn)
+        try:
+            await embed_texts(conn, config, reset)
+        finally:
+            create_hnsw_index(conn)
     finally:
         conn.close()
