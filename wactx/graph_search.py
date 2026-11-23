@@ -3,121 +3,274 @@ from __future__ import annotations
 import importlib
 import logging
 import time
-from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import duckdb
 
+from wactx.db import table_exists
+
 if TYPE_CHECKING:
-    import networkx as nx
+    import numpy as np
+    import scipy.sparse as sp
 
 log = logging.getLogger("wactx.graph_search")
 
-_NX_GRAPH_CACHE: dict[str, "nx.DiGraph"] = {}
+
+# Person graph used by PPR and PathRAG.
+#
+# This used to be a networkx DiGraph built edge-by-edge in Python on every search (one
+# process per CLI call, so the cache never helped): ~5M edges took ~28 s to build and
+# ~13 s more to convert for one pagerank call. The same weighted edges are now
+# aggregated in DuckDB and loaded straight into a scipy CSR matrix (~2-3 s), and PPR is
+# the same power iteration networkx runs (`_pagerank_scipy`), so scores match it.
+#
+# Edge weights (summed per directed pair, unchanged from the networkx version):
+#   messaged        src -> dst        message_count * 3
+#   conversed       both directions   exchange_count * 5
+#   co-member       both directions   shared groups * 1
+#   co-mention      both directions   shared entities * 2
+_EDGE_PARTS = {
+    "edge_person_messaged": (
+        "SELECT sender_person_id AS s, receiver_person_id AS d, message_count * 3.0 AS w "
+        "FROM edge_person_messaged",
+    ),
+    "edge_person_conversed": (
+        "SELECT person1_id AS s, person2_id AS d, exchange_count * 5.0 AS w FROM edge_person_conversed",
+        "SELECT person2_id AS s, person1_id AS d, exchange_count * 5.0 AS w FROM edge_person_conversed",
+    ),
+    "edge_person_in_group": (
+        "SELECT e1.person_id AS s, e2.person_id AS d, COUNT(*) * 1.0 AS w "
+        "FROM edge_person_in_group e1 JOIN edge_person_in_group e2 "
+        "ON e1.group_jid = e2.group_jid AND e1.person_id != e2.person_id GROUP BY 1, 2",
+    ),
+    "edge_person_mentions_entity": (
+        "SELECT e1.person_id AS s, e2.person_id AS d, COUNT(*) * 2.0 AS w "
+        "FROM edge_person_mentions_entity e1 JOIN edge_person_mentions_entity e2 "
+        "ON e1.entity_id = e2.entity_id AND e1.person_id != e2.person_id GROUP BY 1, 2",
+    ),
+}
 
 
-def _build_nx_graph(conn: duckdb.DuckDBPyConnection) -> "nx.DiGraph":
-    import networkx as nx
+@dataclass
+class PersonGraph:
+    """Directed weighted person graph; node i is the person whose JID is node_ids[i]."""
 
-    cache_key = "person_graph"
-    cached = _NX_GRAPH_CACHE.get(cache_key)
+    node_ids: list[str]
+    index: dict[str, int]
+    adj: "sp.csr_matrix"
+    _transition_t: "sp.csr_matrix | None" = field(default=None, repr=False)
+    _dangling: "np.ndarray | None" = field(default=None, repr=False)
+
+    def __len__(self) -> int:
+        return len(self.node_ids)
+
+    def __contains__(self, jid: object) -> bool:
+        return jid in self.index
+
+    @property
+    def num_edges(self) -> int:
+        return int(self.adj.nnz)
+
+    def out_degree(self, i: int) -> int:
+        return int(self.adj.indptr[i + 1] - self.adj.indptr[i])
+
+    def successors(self, i: int) -> "np.ndarray":
+        return self.adj.indices[self.adj.indptr[i] : self.adj.indptr[i + 1]]
+
+    def transition_t(self) -> tuple["sp.csr_matrix", "np.ndarray"]:
+        """Transpose of the row-normalised adjacency, and the dangling-node mask."""
+        if self._transition_t is None:
+            import numpy as np
+            import scipy.sparse as sp
+
+            out_strength = np.asarray(self.adj.sum(axis=1)).ravel()
+            inv = np.zeros_like(out_strength)
+            nonzero = out_strength != 0
+            inv[nonzero] = 1.0 / out_strength[nonzero]
+            self._transition_t = (sp.diags(inv) @ self.adj).T.tocsr()
+            self._dangling = ~nonzero
+        return self._transition_t, self._dangling
+
+
+_GRAPH_CACHE: dict[str, PersonGraph] = {}
+
+
+def _empty_graph() -> PersonGraph:
+    import scipy.sparse as sp
+
+    return PersonGraph(node_ids=[], index={}, adj=sp.csr_matrix((0, 0)))
+
+
+# Built by `wactx graph` (materialize_person_graph) so searches do not re-aggregate ~5M
+# edges each time: the finished CSR arrays are stored as BLOBs in one row (~60 MB), which
+# reads back in ~0.1-0.2 s; a row-per-edge table took ~1.2 s and re-aggregating ~3.8 s.
+# Guarded by a fingerprint of the source tables: if the graph was rebuilt by something
+# that did not refresh the stored copy, it is ignored and edges are aggregated instead.
+PERSON_CSR_TABLE = "graph_person_csr"
+
+
+def _edge_union(conn: duckdb.DuckDBPyConnection, parts_by_table: dict[str, tuple[str, ...]]) -> str | None:
+    parts = [q for table, qs in parts_by_table.items() if table_exists(conn, table) for q in qs]
+    if not parts or not table_exists(conn, "graph_persons"):
+        return None
+    return "\n  UNION ALL ".join(parts)
+
+
+def _graph_fingerprint(conn: duckdb.DuckDBPyConnection) -> str:
+    """Order-insensitive row hash of the graph's source tables (~20 ms on the live DB)."""
+    parts = []
+    for table in ("graph_persons", *_EDGE_PARTS):
+        if table_exists(conn, table):
+            # graph_persons.community_id is rewritten after materializing, so leave it out.
+            row_hash = "hash(x.person_id, x.source_id)" if table == "graph_persons" else "hash(x)"
+            row = conn.execute(
+                f"SELECT COUNT(*), COALESCE(SUM({row_hash}), 0) FROM {table} AS x"
+            ).fetchone()
+            parts.append(f"{table}:{row[0]}:{row[1]}")
+    return ";".join(parts)
+
+
+def materialize_person_graph(conn: duckdb.DuckDBPyConnection) -> int:
+    """Store the aggregated PPR/PathRAG graph as CSR arrays for fast loading."""
+    conn.execute(f"DROP TABLE IF EXISTS {PERSON_CSR_TABLE}")
+    t0 = time.time()
+    graph = _load_aggregated(conn)
+    if len(graph) == 0:
+        return 0
+    adj = graph.adj
+    conn.execute(
+        f"""CREATE TABLE {PERSON_CSR_TABLE} (
+            fingerprint VARCHAR, source_ids VARCHAR[], indptr BLOB, indices BLOB, data BLOB)"""
+    )
+    conn.execute(
+        f"INSERT INTO {PERSON_CSR_TABLE} VALUES (?, ?, ?, ?, ?)",
+        [
+            _graph_fingerprint(conn),
+            graph.node_ids,
+            adj.indptr.astype("<i8").tobytes(),
+            adj.indices.astype("<i4").tobytes(),
+            adj.data.astype("<f8").tobytes(),
+        ],
+    )
+    log.info("Materialized person graph: %d edges in %.2fs", adj.nnz, time.time() - t0)
+    return int(adj.nnz)
+
+
+def _load_materialized(conn: duckdb.DuckDBPyConnection) -> PersonGraph | None:
+    import numpy as np
+    import scipy.sparse as sp
+
+    if not table_exists(conn, PERSON_CSR_TABLE):
+        return None
+    row = conn.execute(f"SELECT fingerprint FROM {PERSON_CSR_TABLE}").fetchone()
+    if row is None or row[0] != _graph_fingerprint(conn):
+        log.info("Stored person graph is stale; aggregating edges instead (run `wactx graph`)")
+        return None
+    source_ids, indptr, indices, data = conn.execute(
+        f"SELECT source_ids, indptr, indices, data FROM {PERSON_CSR_TABLE}"
+    ).fetchone()
+    n = len(source_ids)
+    adj = sp.csr_matrix(
+        (
+            np.frombuffer(data, dtype="<f8"),
+            np.frombuffer(indices, dtype="<i4"),
+            np.frombuffer(indptr, dtype="<i8"),
+        ),
+        shape=(n, n),
+    )
+    node_ids = list(source_ids)
+    return PersonGraph(node_ids=node_ids, index={j: i for i, j in enumerate(node_ids)}, adj=adj)
+
+
+def _load_aggregated(conn: duckdb.DuckDBPyConnection) -> PersonGraph:
+    import numpy as np
+    import scipy.sparse as sp
+
+    union = _edge_union(conn, _EDGE_PARTS)
+    if union is None:
+        return _empty_graph()
+    sql = f"""
+        WITH e AS (
+          {union}
+        ), agg AS (
+          SELECT s, d, SUM(w) AS w FROM e GROUP BY s, d
+        )
+        SELECT agg.s, agg.d, agg.w
+        FROM agg
+        JOIN graph_persons ps ON ps.person_id = agg.s
+        JOIN graph_persons pd ON pd.person_id = agg.d
+    """
+    edges = conn.execute(sql).fetchnumpy()
+    persons = conn.execute("SELECT person_id, source_id FROM graph_persons ORDER BY person_id").fetchnumpy()
+
+    src = np.asarray(edges["s"], dtype=np.int64)
+    dst = np.asarray(edges["d"], dtype=np.int64)
+    weight = np.asarray(edges["w"], dtype=np.float64)
+    # Nodes are the people with at least one edge (as in the networkx graph).
+    nodes = np.unique(np.concatenate([src, dst]))
+    pid_sorted = np.asarray(persons["person_id"], dtype=np.int64)
+    jid_sorted = np.asarray(persons["source_id"], dtype=object)
+    node_ids = [str(j) for j in jid_sorted[np.searchsorted(pid_sorted, nodes)]]
+    n = len(nodes)
+    adj = sp.csr_matrix((weight, (np.searchsorted(nodes, src), np.searchsorted(nodes, dst))), shape=(n, n))
+    adj.sum_duplicates()
+    return PersonGraph(node_ids=node_ids, index={j: i for i, j in enumerate(node_ids)}, adj=adj)
+
+
+def load_person_graph(conn: duckdb.DuckDBPyConnection) -> PersonGraph:
+    cached = _GRAPH_CACHE.get("person_graph")
     if cached is not None:
         return cached
-
-    G = nx.DiGraph()
-
+    t0 = time.time()
+    source = "materialized"
     try:
-        rows = conn.execute(
-            """
-            SELECT gp1.source_id AS src, gp2.source_id AS dst, epm.message_count * 3.0 AS weight
-            FROM edge_person_messaged epm
-            JOIN graph_persons gp1 ON epm.sender_person_id = gp1.person_id
-            JOIN graph_persons gp2 ON epm.receiver_person_id = gp2.person_id
-        """
-        ).fetchall()
-        for src, dst, w in rows:
-            G.add_edge(
-                src,
-                dst,
-                weight=G.get_edge_data(src, dst, {}).get("weight", 0) + float(w),
-            )
-    except Exception:
-        pass
-
-    try:
-        rows = conn.execute(
-            """
-            SELECT gp1.source_id AS src, gp2.source_id AS dst, epc.exchange_count * 5.0 AS weight
-            FROM edge_person_conversed epc
-            JOIN graph_persons gp1 ON epc.person1_id = gp1.person_id
-            JOIN graph_persons gp2 ON epc.person2_id = gp2.person_id
-        """
-        ).fetchall()
-        for src, dst, w in rows:
-            G.add_edge(
-                src,
-                dst,
-                weight=G.get_edge_data(src, dst, {}).get("weight", 0) + float(w),
-            )
-            G.add_edge(
-                dst,
-                src,
-                weight=G.get_edge_data(dst, src, {}).get("weight", 0) + float(w),
-            )
-    except Exception:
-        pass
-
-    try:
-        rows = conn.execute(
-            """
-            SELECT gp1.source_id AS src, gp2.source_id AS dst, COUNT(*) * 1.0 AS weight
-            FROM edge_person_in_group e1
-            JOIN edge_person_in_group e2 ON e1.group_jid = e2.group_jid AND e1.person_id != e2.person_id
-            JOIN graph_persons gp1 ON e1.person_id = gp1.person_id
-            JOIN graph_persons gp2 ON e2.person_id = gp2.person_id
-            GROUP BY gp1.source_id, gp2.source_id
-        """
-        ).fetchall()
-        for src, dst, w in rows:
-            G.add_edge(
-                src,
-                dst,
-                weight=G.get_edge_data(src, dst, {}).get("weight", 0) + float(w),
-            )
-    except Exception:
-        pass
-
-    try:
-        rows = conn.execute(
-            """
-            SELECT gp1.source_id AS src, gp2.source_id AS dst, COUNT(*) * 2.0 AS weight
-            FROM edge_person_mentions_entity e1
-            JOIN edge_person_mentions_entity e2 ON e1.entity_id = e2.entity_id AND e1.person_id != e2.person_id
-            JOIN graph_persons gp1 ON e1.person_id = gp1.person_id
-            JOIN graph_persons gp2 ON e2.person_id = gp2.person_id
-            GROUP BY gp1.source_id, gp2.source_id
-        """
-        ).fetchall()
-        for src, dst, w in rows:
-            G.add_edge(
-                src,
-                dst,
-                weight=G.get_edge_data(src, dst, {}).get("weight", 0) + float(w),
-            )
-    except Exception:
-        pass
-
+        graph = _load_materialized(conn)
+        if graph is None:
+            source = "aggregated"
+            graph = _load_aggregated(conn)
+    except duckdb.Error as exc:
+        log.warning("Could not load the person graph; graph ranking disabled: %s", exc)
+        graph = _empty_graph()
     log.info(
-        "Built NetworkX graph: %d nodes, %d edges",
-        G.number_of_nodes(),
-        G.number_of_edges(),
+        "Loaded person graph (%s): %d nodes, %d edges in %.2fs",
+        source, len(graph), graph.num_edges, time.time() - t0,
     )
-    _NX_GRAPH_CACHE[cache_key] = G
-    return G
+    _GRAPH_CACHE["person_graph"] = graph
+    return graph
 
 
 def clear_graph_cache() -> None:
-    _NX_GRAPH_CACHE.clear()
+    _GRAPH_CACHE.clear()
+
+
+class PowerIterationFailedConvergence(RuntimeError):
+    pass
+
+
+def _personalized_pagerank(
+    graph: PersonGraph,
+    personalization: dict[int, float],
+    alpha: float,
+    max_iter: int,
+    tol: float,
+) -> "np.ndarray":
+    """networkx `_pagerank_scipy`: dangling mass and teleport both go to the personalization."""
+    import numpy as np
+
+    n = len(graph)
+    transition_t, dangling = graph.transition_t()
+    p = np.zeros(n)
+    for i, v in personalization.items():
+        p[i] = v
+    p /= p.sum()
+    x = np.full(n, 1.0 / n)
+    for _ in range(max_iter):
+        x_last = x
+        x = alpha * (transition_t @ x + x[dangling].sum() * p) + (1 - alpha) * p
+        if np.abs(x - x_last).sum() < n * tol:
+            return x
+    raise PowerIterationFailedConvergence(max_iter)
 
 
 def ppr_score(
@@ -128,51 +281,33 @@ def ppr_score(
     max_iter: int = 100,
     top_k: int = 50,
 ) -> list[tuple[str, float]]:
-    import networkx as nx
+    import numpy as np
 
-    G = _build_nx_graph(conn)
-    if G.number_of_nodes() == 0:
+    G = load_person_graph(conn)
+    if len(G) == 0:
         return []
 
     if seed_scores is None:
         seed_scores = {jid: 1.0 for jid in seed_jids}
 
-    personalization = {}
     total = sum(seed_scores.get(jid, 1.0) for jid in seed_jids if jid in G)
     if total == 0:
         return []
-    for jid in seed_jids:
-        if jid in G:
-            personalization[jid] = seed_scores.get(jid, 1.0) / total
-
+    personalization = {
+        G.index[jid]: seed_scores.get(jid, 1.0) / total for jid in seed_jids if jid in G
+    }
     if not personalization:
         return []
 
     t0 = time.time()
     try:
-        scores = nx.pagerank(
-            G,
-            alpha=alpha,
-            personalization=personalization,
-            weight="weight",
-            max_iter=max_iter,
-            tol=1e-8,
-        )
-    except nx.PowerIterationFailedConvergence:
-        scores = nx.pagerank(
-            G,
-            alpha=alpha,
-            personalization=personalization,
-            weight="weight",
-            max_iter=300,
-            tol=1e-6,
-        )
+        scores = _personalized_pagerank(G, personalization, alpha, max_iter, tol=1e-8)
+    except PowerIterationFailedConvergence:
+        scores = _personalized_pagerank(G, personalization, alpha, 300, tol=1e-6)
+    log.info("PPR completed in %.2fs (%d nodes scored)", time.time() - t0, len(scores))
 
-    elapsed = time.time() - t0
-    log.info("PPR completed in %.2fs (%d nodes scored)", elapsed, len(scores))
-
-    ranked = sorted(scores.items(), key=lambda x: -x[1])
-    return [(jid, score) for jid, score in ranked[:top_k] if score > 0]
+    order = np.argsort(-scores, kind="stable")[:top_k]
+    return [(G.node_ids[i], float(scores[i])) for i in order if scores[i] > 0]
 
 
 def pathrag_flow(
@@ -189,10 +324,11 @@ def pathrag_flow(
     S(v_i) = Σ [α · S(v_j) / degree(v_j)]
     Path score = avg(S(v_i)) across path nodes.
     """
-    import networkx as nx
+    import numpy as np
+    from scipy.sparse.csgraph import breadth_first_order
 
-    G = _build_nx_graph(conn)
-    if G.number_of_nodes() == 0:
+    G = load_person_graph(conn)
+    if len(G) == 0:
         return []
 
     seed_set = [j for j in seed_jids if j in G]
@@ -200,67 +336,98 @@ def pathrag_flow(
         return []
 
     t0 = time.time()
+    n = len(G)
+    floor = theta * 0.001
 
-    seed_resources: dict[str, dict[str, float]] = {}
+    seed_resources: dict[str, np.ndarray] = {}
     for source in seed_set[:8]:
-        resource: dict[str, float] = defaultdict(float)
-        resource[source] = 1.0
+        resource = np.zeros(n)
+        start = G.index[source]
+        resource[start] = 1.0
 
-        frontier = {source}
+        frontier = {start}
         for _hop in range(max_hops):
-            next_frontier: set[str] = set()
-            for node in list(frontier)[:500]:
+            next_frontier: set[int] = set()
+            # Cap each hop at the 500 highest-resource nodes (ties by index). The networkx
+            # version took the first 500 of a set of JIDs, whose order changes per process
+            # with string hashing, so its paths varied run to run for the same query.
+            ranked = sorted(frontier, key=lambda k: (-resource[k], k))
+            for node in ranked[:500]:
                 out_deg = G.out_degree(node)
                 if out_deg == 0:
                     continue
                 share = alpha * resource[node] / out_deg
-                if share < theta * 0.001:
+                if share < floor:
                     continue
-                for neighbor in G.successors(node):
-                    resource[neighbor] += share
-                    if resource[neighbor] > theta * 0.001:
-                        next_frontier.add(neighbor)
+                neighbors = G.successors(node)
+                resource[neighbors] += share
+                next_frontier.update(neighbors[resource[neighbors] > floor].tolist())
             frontier = next_frontier
             if not frontier:
                 break
         seed_resources[source] = resource
 
+    zeros = np.zeros(n)
+    predecessors: dict[int, np.ndarray] = {}
     all_paths: list[dict] = []
     for i, source in enumerate(seed_set[:8]):
+        s_idx = G.index[source]
         for target in seed_set[i + 1 :]:
-            src_res = seed_resources.get(source, {})
-            tgt_res = seed_resources.get(target, {})
+            t_idx = G.index[target]
+            src_res = seed_resources.get(source, zeros)
+            tgt_res = seed_resources.get(target, zeros)
 
-            if (
-                src_res.get(target, 0) < theta * 0.0001
-                and tgt_res.get(source, 0) < theta * 0.0001
-            ):
+            if src_res[t_idx] < theta * 0.0001 and tgt_res[s_idx] < theta * 0.0001:
                 continue
 
-            try:
-                path = nx.shortest_path(G, source, target, weight=None)
-                if len(path) > max_hops + 1:
-                    continue
-                combined_resource = {
-                    n: max(src_res.get(n, 0), tgt_res.get(n, 0)) for n in path
-                }
-                path_score = sum(combined_resource.values()) / len(path)
-                all_paths.append(
-                    {
-                        "source": source,
-                        "target": target,
-                        "path": path,
-                        "score": path_score,
-                        "hops": len(path) - 1,
-                    }
+            # Unweighted directed shortest path (networkx shortest_path(weight=None)).
+            if s_idx not in predecessors:
+                _, predecessors[s_idx] = breadth_first_order(
+                    G.adj, s_idx, directed=True, return_predecessors=True
                 )
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                pass
+            pred = predecessors[s_idx]
+            path_idx = [t_idx]
+            while path_idx[-1] != s_idx and len(path_idx) <= max_hops + 1:
+                prev = pred[path_idx[-1]]
+                if prev < 0:
+                    break
+                path_idx.append(int(prev))
+            if path_idx[-1] != s_idx or len(path_idx) > max_hops + 1:
+                continue
+            path_idx.reverse()
+
+            path_score = sum(max(src_res[k], tgt_res[k]) for k in path_idx) / len(path_idx)
+            all_paths.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "path": [G.node_ids[k] for k in path_idx],
+                    "score": float(path_score),
+                    "hops": len(path_idx) - 1,
+                }
+            )
 
     all_paths.sort(key=lambda x: -x["score"])
-    elapsed = time.time() - t0
-    log.info("PathRAG flow: %d paths scored in %.2fs", len(all_paths), elapsed)
+    log.info("PathRAG flow: %d paths scored in %.2fs", len(all_paths), time.time() - t0)
     return all_paths[:top_k]
+
+
+# Leiden's edge set (unchanged): messaged x3, conversed x5 (one row per pair), shared
+# groups x1, summed per unordered pair; nodes sorted by JID.
+_LEIDEN_PARTS = {
+    "edge_person_messaged": (
+        "SELECT sender_person_id AS s, receiver_person_id AS d, message_count * 3.0 AS w "
+        "FROM edge_person_messaged",
+    ),
+    "edge_person_conversed": (
+        "SELECT person1_id AS s, person2_id AS d, exchange_count * 5.0 AS w FROM edge_person_conversed",
+    ),
+    "edge_person_in_group": (
+        "SELECT e1.person_id AS s, e2.person_id AS d, COUNT(*) * 1.0 AS w "
+        "FROM edge_person_in_group e1 JOIN edge_person_in_group e2 "
+        "ON e1.group_jid = e2.group_jid AND e1.person_id < e2.person_id GROUP BY 1, 2",
+    ),
+}
 
 
 def leiden_communities(
@@ -275,79 +442,50 @@ def leiden_communities(
         )
         return {}
 
+    import numpy as np
+
     t0 = time.time()
-
-    edges = []
-    try:
-        rows = conn.execute(
-            """
-            SELECT gp1.source_id, gp2.source_id, epm.message_count
-            FROM edge_person_messaged epm
-            JOIN graph_persons gp1 ON epm.sender_person_id = gp1.person_id
-            JOIN graph_persons gp2 ON epm.receiver_person_id = gp2.person_id
-        """
-        ).fetchall()
-        edges.extend((r[0], r[1], float(r[2]) * 3.0) for r in rows)
-    except Exception:
-        pass
-
-    try:
-        rows = conn.execute(
-            """
-            SELECT gp1.source_id, gp2.source_id, epc.exchange_count
-            FROM edge_person_conversed epc
-            JOIN graph_persons gp1 ON epc.person1_id = gp1.person_id
-            JOIN graph_persons gp2 ON epc.person2_id = gp2.person_id
-        """
-        ).fetchall()
-        edges.extend((r[0], r[1], float(r[2]) * 5.0) for r in rows)
-    except Exception:
-        pass
-
-    try:
-        rows = conn.execute(
-            """
-            SELECT gp1.source_id, gp2.source_id, COUNT(*)
-            FROM edge_person_in_group e1
-            JOIN edge_person_in_group e2 ON e1.group_jid = e2.group_jid AND e1.person_id < e2.person_id
-            JOIN graph_persons gp1 ON e1.person_id = gp1.person_id
-            JOIN graph_persons gp2 ON e2.person_id = gp2.person_id
-            GROUP BY gp1.source_id, gp2.source_id
-        """
-        ).fetchall()
-        edges.extend((r[0], r[1], float(r[2])) for r in rows)
-    except Exception:
-        pass
-
-    if not edges:
+    union = _edge_union(conn, _LEIDEN_PARTS)
+    if union is None:
         return {}
 
-    node_set: set[str] = set()
-    for s, t, _ in edges:
-        node_set.add(s)
-        node_set.add(t)
-    node_list = sorted(node_set)
-    node_idx = {n: i for i, n in enumerate(node_list)}
+    # Was: ~2.5M rows fetched as Python tuples and de-duplicated with list.index() (11.6 s).
+    conn.execute(
+        f"""
+        CREATE OR REPLACE TEMP TABLE _leiden_edges AS
+        WITH e AS (
+          {union}
+        ), u AS (
+          SELECT LEAST(s, d) AS a, GREATEST(s, d) AS b, SUM(w) AS w FROM e GROUP BY 1, 2
+        )
+        SELECT u.a, u.b, u.w
+        FROM u
+        JOIN graph_persons pa ON pa.person_id = u.a
+        JOIN graph_persons pb ON pb.person_id = u.b
+        """
+    )
+    try:
+        nodes = conn.execute(
+            """
+            SELECT person_id, source_id FROM graph_persons
+            WHERE person_id IN (SELECT a FROM _leiden_edges UNION SELECT b FROM _leiden_edges)
+            ORDER BY source_id
+            """
+        ).fetchnumpy()
+        edges = conn.execute("SELECT a, b, w FROM _leiden_edges").fetchnumpy()
+    finally:
+        conn.execute("DROP TABLE IF EXISTS _leiden_edges")
 
-    G = ig.Graph(n=len(node_list), directed=False)
-    G.vs["name"] = node_list
+    node_list = [str(j) for j in nodes["source_id"]]
+    if not node_list:
+        return {}
+    pids = np.asarray(nodes["person_id"], dtype=np.int64)
+    order = np.argsort(pids)
+    pos = order[np.searchsorted(pids[order], np.asarray(edges["a"], dtype=np.int64))]
+    pos_b = order[np.searchsorted(pids[order], np.asarray(edges["b"], dtype=np.int64))]
 
-    edge_tuples = []
-    edge_weights = []
-    seen_edges: set[tuple[int, int]] = set()
-    for s, t, w in edges:
-        si, ti = node_idx[s], node_idx[t]
-        key = (min(si, ti), max(si, ti))
-        if key in seen_edges:
-            idx = edge_tuples.index(key)
-            edge_weights[idx] += w
-            continue
-        seen_edges.add(key)
-        edge_tuples.append(key)
-        edge_weights.append(w)
-
-    G.add_edges(edge_tuples)
-    G.es["weight"] = edge_weights
+    G = ig.Graph(n=len(node_list), edges=np.column_stack([pos, pos_b]).tolist(), directed=False)
+    G.es["weight"] = np.asarray(edges["w"], dtype=np.float64).tolist()
 
     partition = G.community_leiden(
         objective_function="modularity",
@@ -356,17 +494,12 @@ def leiden_communities(
         n_iterations=3,
     )
 
-    communities = {}
-    for i, community_id in enumerate(partition.membership):
-        communities[node_list[i]] = community_id
-
-    n_communities = len(set(communities.values()))
-    elapsed = time.time() - t0
+    communities = {node_list[i]: cid for i, cid in enumerate(partition.membership)}
     log.info(
         "Leiden: %d communities from %d people in %.2fs",
-        n_communities,
+        len(set(communities.values())),
         len(communities),
-        elapsed,
+        time.time() - t0,
     )
     return communities
 
@@ -378,18 +511,24 @@ def store_communities(
     if not communities:
         return {}
 
-    try:
-        conn.execute(
-            "ALTER TABLE graph_persons ADD COLUMN community_id INTEGER DEFAULT -1"
-        )
-    except Exception:
+    cols = {r[0] for r in conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'graph_persons'"
+    ).fetchall()}
+    if "community_id" not in cols:
+        conn.execute("ALTER TABLE graph_persons ADD COLUMN community_id INTEGER DEFAULT -1")
+    else:
         conn.execute("UPDATE graph_persons SET community_id = -1")
 
-    for jid, cid in communities.items():
-        conn.execute(
-            "UPDATE graph_persons SET community_id = ? WHERE source_id = ?",
-            [cid, jid],
-        )
+    # One statement instead of one UPDATE per person (~9.7k statements, 25 s).
+    jids = list(communities)
+    conn.execute(
+        """
+        UPDATE graph_persons SET community_id = c.community_id
+        FROM (SELECT UNNEST(?::VARCHAR[]) AS source_id, UNNEST(?::INTEGER[]) AS community_id) c
+        WHERE graph_persons.source_id = c.source_id
+        """,
+        [jids, [int(communities[j]) for j in jids]],
+    )
 
     summaries: dict[int, dict] = {}
     try:
@@ -417,7 +556,7 @@ def store_communities(
                     JOIN graph_groups gg ON epg.group_jid = gg.group_jid
                     WHERE gp.community_id = ?
                     GROUP BY gg.group_name
-                    ORDER BY total DESC LIMIT 3
+                    ORDER BY total DESC, gg.group_name LIMIT 3
                 """,
                     [cid],
                 ).fetchall()
@@ -435,7 +574,7 @@ def store_communities(
                     JOIN graph_entities ge ON epm.entity_id = ge.entity_id
                     WHERE gp.community_id = ?
                     GROUP BY ge.entity_value
-                    ORDER BY total DESC LIMIT 5
+                    ORDER BY total DESC, ge.entity_value LIMIT 5
                 """,
                     [cid],
                 ).fetchall()

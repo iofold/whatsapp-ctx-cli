@@ -1457,7 +1457,6 @@ dependencies = [
     { name = "click" },
     { name = "duckdb" },
     { name = "igraph" },
-    { name = "networkx" },
     { name = "openai" },
     { name = "pytz" },
     { name = "rich" },
@@ -1467,6 +1466,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "networkx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -1479,7 +1479,6 @@ requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "duckdb", specifier = ">=1.5,<2" },
     { name = "igraph", specifier = ">=0.11" },
-    { name = "networkx", specifier = ">=3.0" },
     { name = "openai", specifier = ">=1.0" },
     { name = "pytz" },
     { name = "rich", specifier = ">=13.0" },
@@ -1489,6 +1488,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "networkx", specifier = ">=3.0" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
 ]

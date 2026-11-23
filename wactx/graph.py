@@ -306,10 +306,15 @@ def build_graph(conn: duckdb.DuckDBPyConnection, config: Config) -> dict:
     stats.update(build_edge_tables(conn))
     create_property_graph(conn)
 
+    graph_search = importlib.import_module("wactx.graph_search")
+    graph_search.clear_graph_cache()
     try:
-        graph_search = importlib.import_module("wactx.graph_search")
+        stats["graph_person_edges"] = graph_search.materialize_person_graph(conn)
+    except duckdb.Error as e:
+        # Searches fall back to aggregating the edges themselves (slower, same result).
+        log.warning("Materializing the person graph failed: %s", e)
 
-        graph_search.clear_graph_cache()
+    try:
         communities = graph_search.leiden_communities(conn)
         if communities:
             summaries = graph_search.store_communities(conn, communities)
