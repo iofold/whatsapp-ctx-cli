@@ -9,7 +9,29 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: whatsapp-sync/go.mod
+          cache-dependency-path: whatsapp-sync/go.sum
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+      - name: Go vet + tests
+        working-directory: whatsapp-sync
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Python tests
+        run: |
+          uv sync --locked
+          uv run pytest tests/ -q
+
   build-go:
+    needs: test
     strategy:
       matrix:
         include:
@@ -31,10 +53,11 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.24"
+          go-version-file: whatsapp-sync/go.mod
+          cache-dependency-path: whatsapp-sync/go.sum
 
       - name: Install cross-compilation deps (Linux arm64)
         if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
@@ -58,7 +81,7 @@ jobs:
           go build -o "../wactx/bin/${BINARY_NAME}" .
           ls -lh "../wactx/bin/${BINARY_NAME}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
           path: wactx/bin/whatsapp-sync-*
@@ -86,12 +109,14 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.go_artifact }}
           path: wactx/bin/
@@ -115,8 +140,10 @@ jobs:
         shell: bash
         run: |
           pip install build setuptools setuptools-scm wheel
-          VERSION="${GITHUB_REF_NAME#v}"
-          SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION" python -m build --wheel
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export SETUPTOOLS_SCM_PRETEND_VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          python -m build --wheel
 
       - name: Rename wheel for platform
         shell: bash
@@ -130,7 +157,7 @@ jobs:
           done
           ls -la
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.platform }}
           path: dist/*.whl
@@ -142,7 +169,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheel-*
           path: dist/
