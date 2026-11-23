@@ -15,7 +15,8 @@ dependencies = [
     "openai>=1.0",
     "pytz",
     "rich>=13.0",
-    "spacy>=3.7",
+    # 3.8.18 is the first release tested here on Python 3.14 (older ones crash in confection).
+    "spacy>=3.8.18",
 ]
 
 [tool.uv.sources]

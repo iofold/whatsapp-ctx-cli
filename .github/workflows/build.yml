@@ -10,6 +10,10 @@ permissions:
 
 jobs:
   test:
+    strategy:
+      matrix:
+        # Oldest we build wheels with, and newest: fresh uv tool installs pick the newest Python.
+        python: ["3.12", "3.14"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -19,7 +23,7 @@ jobs:
           cache-dependency-path: whatsapp-sync/go.sum
       - uses: astral-sh/setup-uv@v10.4.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - name: Go vet + tests
         working-directory: whatsapp-sync
         run: |
