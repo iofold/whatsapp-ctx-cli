@@ -5,9 +5,9 @@ import os
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
-console = Console(width=int(os.environ.get("COLUMNS", 0)) or None)
+_columns = os.environ.get("COLUMNS", "")
+console = Console(width=int(_columns) if _columns.isdigit() and int(_columns) > 0 else None)
 
 
 def _ts(dt) -> str:
@@ -216,7 +216,7 @@ def render_search_results(data: dict) -> None:
             rel_strs.append(
                 f"{r['person1']} \u2194 {r['person2']} ({r['exchanges']}x{groups})"
             )
-        console.print(f"[bold]Key relationships:[/bold] " + "  \u2502  ".join(rel_strs))
+        console.print("[bold]Key relationships:[/bold] " + "  \u2502  ".join(rel_strs))
 
     paths = insights.get("paths", [])
     if paths:
@@ -235,7 +235,7 @@ def render_search_results(data: dict) -> None:
             except Exception:
                 pass
         if path_strs:
-            console.print(f"[bold]Paths:[/bold] " + "  |  ".join(path_strs))
+            console.print("[bold]Paths:[/bold] " + "  |  ".join(path_strs))
 
 
 def render_stats(stats: dict) -> None:

@@ -605,7 +605,6 @@ def run_search(
     after: str | None = None,
     before: str | None = None,
 ) -> dict:
-    import click
 
     preset = DEPTH_PRESETS.get(depth, DEPTH_PRESETS["balanced"])
     n_variants = variants if variants is not None else preset["variants"]

@@ -55,7 +55,6 @@ def _ensure_sync_binary(cfg: Config) -> None:
 
     import shutil
     import subprocess
-    import platform as plat
 
     go_bin = shutil.which("go")
     if go_bin:
@@ -401,10 +400,10 @@ def search(
             continue
         try:
             datetime.strptime(value, "%Y-%m-%d")
-        except ValueError:
+        except ValueError as exc:
             raise click.BadParameter(
                 f"{label} must be YYYY-MM-DD, got {value!r}", param_hint=label
-            )
+            ) from exc
 
     cfg = ctx.obj["config"]
     depth = depth or cfg.search.default_depth
@@ -427,7 +426,7 @@ def search(
         )
     except ValueError as e:
         conn.close()
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     if output_json:
         conn.close()

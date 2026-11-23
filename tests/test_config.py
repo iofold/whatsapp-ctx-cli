@@ -1,5 +1,3 @@
-import tempfile
-from pathlib import Path
 
 from wactx.config import Config, load_config, save_config, set_config_value
 

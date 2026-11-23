@@ -1,4 +1,3 @@
-import duckdb
 
 from wactx.config import Config
 from wactx.db import get_connection, ensure_schema, get_table_counts, table_exists
