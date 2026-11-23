@@ -7,6 +7,7 @@ import logging
 import time
 
 import duckdb
+import openai
 from openai import OpenAI
 
 from wactx.config import Config
@@ -46,25 +47,43 @@ def _phone_from_jid(jid: str) -> str:
     return f"+{num}" if num.isdigit() else ""
 
 
+# Query expansion is a short rewrite; on reasoning models the default effort spent ~450
+# hidden tokens and ~8 s per search on it (gpt-5-mini, 2026-11-23) vs ~2.6 s at "minimal".
+_LOW_EFFORT = {"reasoning_effort": "minimal"}
+
+
+def _wants_low_effort(model: str) -> bool:
+    return model.startswith("gpt-5")
+
+
 def expand_query(client: OpenAI, config: Config, query: str, n: int) -> list[str]:
     if n <= 1:
         return [query]
+    messages = [
+        {"role": "user", "content": QUERY_EXPANSION_PROMPT.format(query=query, n=n - 1)}
+    ]
+    extra = _LOW_EFFORT if _wants_low_effort(config.api.chat_model) else {}
     try:
-        resp = client.chat.completions.create(
-            model=config.api.chat_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": QUERY_EXPANSION_PROMPT.format(query=query, n=n - 1),
-                }
-            ],
-            max_completion_tokens=1024,
-        )
+        try:
+            resp = client.chat.completions.create(
+                model=config.api.chat_model,
+                messages=messages,
+                max_completion_tokens=1024,
+                **extra,
+            )
+        except openai.BadRequestError:
+            if not extra:
+                raise
+            # A model/provider that rejects the effort hint: retry once without it.
+            resp = client.chat.completions.create(
+                model=config.api.chat_model, messages=messages, max_completion_tokens=1024
+            )
         text = (resp.choices[0].message.content or "").strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         return [query] + json.loads(text)[: n - 1]
-    except Exception:
+    except Exception as exc:
+        log.warning("Query expansion failed; searching the original query only: %s", exc)
         return [query]
 
 
@@ -211,14 +230,34 @@ def semantic_search(
         # Served by the HNSW index (metric 'cosine') only in this exact shape: ORDER BY the
         # distance alias, LIMIT. Repeating the distance expression in the SELECT list makes
         # the planner fall back to a full scan. Without the index this is an exact scan.
-        _set_hnsw_ef_search(conn)
         sql = f"""SELECT {columns},
                          array_cosine_distance(embedding, ?::FLOAT[{dims}]) AS distance
                   FROM messages
                   ORDER BY distance LIMIT ?"""
+    if not filter_clauses:
+        _note_missing_index(conn)
+
+    def run_one(qvec: list[float]) -> list[tuple]:
+        # One cursor (its own DuckDB connection) per variant: DuckDB releases the GIL while
+        # executing, so the ~0.3-0.5 s index scans overlap instead of running back to back.
+        cur = conn.cursor()
+        try:
+            if not filter_clauses:
+                _set_hnsw_ef_search(cur)
+            return cur.execute(sql, [qvec, *filter_params, top_k]).fetchall()
+        finally:
+            cur.close()
+
+    if len(vectors) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(len(vectors), 8)) as pool:
+            per_query = list(pool.map(run_one, vectors))
+    else:
+        per_query = [run_one(v) for v in vectors]
+
     all_results: dict[tuple[str, str], dict] = {}
-    for qvec in vectors:
-        rows = conn.execute(sql, [qvec, *filter_params, top_k]).fetchall()
+    for rows in per_query:  # merged in variant order, so ties resolve as before
         for r in rows:
             if r[8] is None:
                 continue
@@ -239,6 +278,24 @@ def semantic_search(
     return sorted(all_results.values(), key=lambda x: x["similarity"], reverse=True)[
         :top_k
     ]
+
+
+_index_checked = False
+
+
+def _note_missing_index(conn: duckdb.DuckDBPyConnection) -> None:
+    global _index_checked
+    if _index_checked:
+        return
+    _index_checked = True
+    try:
+        row = conn.execute(
+            "SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx_msg_embedding'"
+        ).fetchone()
+    except duckdb.Error:
+        return
+    if row and row[0] == 0:
+        log.info("Vector index missing, using an exact scan; `wactx index` rebuilds it")
 
 
 def _set_hnsw_ef_search(conn: duckdb.DuckDBPyConnection) -> None:
@@ -280,17 +337,80 @@ def enrich_results(
 ) -> list[dict]:
     from wactx.db import table_exists
 
-    for r in results:
-        row = conn.execute(
-            "SELECT COALESCE(group_name, push_name, jid), is_group FROM contacts WHERE jid = ?",
-            [r["chat_jid"]],
-        ).fetchone()
-        r["group_name"] = (row[0] if row[1] else "DM") if row else r["chat_jid"]
+    # Results repeat chats and senders, so every lookup runs once per JID instead of once
+    # per result (5 queries x ~60 results per search before).
+    chat_labels: dict[str, str] = {}
+    contacts: dict[str, tuple | None] = {}
+    graph_info: dict[str, tuple[int, list, list]] = {}
+    has_mentions = use_graph and table_exists(conn, "edge_person_mentions_entity")
 
-        row = conn.execute(
-            "SELECT push_name, full_name, jid FROM contacts WHERE jid = ?",
-            [r["sender_jid"]],
-        ).fetchone()
+    def chat_label(jid: str) -> str:
+        if jid not in chat_labels:
+            row = conn.execute(
+                "SELECT COALESCE(group_name, push_name, jid), is_group FROM contacts WHERE jid = ?",
+                [jid],
+            ).fetchone()
+            chat_labels[jid] = (row[0] if row[1] else "DM") if row else jid
+        return chat_labels[jid]
+
+    def contact(jid: str) -> tuple | None:
+        if jid not in contacts:
+            contacts[jid] = conn.execute(
+                "SELECT push_name, full_name, jid FROM contacts WHERE jid = ?", [jid]
+            ).fetchone()
+        return contacts[jid]
+
+    def person_graph_info(jid: str) -> tuple[int, list, list]:
+        if jid in graph_info:
+            return graph_info[jid]
+        dm_volume, shared_groups, entities = 0, [], []
+        try:
+            dm = conn.execute(
+                """SELECT COALESCE(SUM(message_count), 0)
+                   FROM edge_person_messaged epm
+                   JOIN graph_persons gp ON (epm.sender_person_id = gp.person_id OR epm.receiver_person_id = gp.person_id)
+                   WHERE gp.source_id = ?""",
+                [jid],
+            ).fetchone()
+            dm_volume = dm[0] if dm else 0
+        except duckdb.Error as e:
+            log.debug("dm_volume lookup failed: %s", e)
+        try:
+            if owner_name:
+                shared = conn.execute(
+                    """SELECT LIST(DISTINCT gg.group_name)
+                       FROM edge_person_in_group e1
+                       JOIN edge_person_in_group e2 ON e1.group_jid = e2.group_jid
+                       JOIN graph_groups gg ON e1.group_jid = gg.group_jid
+                       JOIN graph_persons gp1 ON e1.person_id = gp1.person_id
+                       JOIN graph_persons gp2 ON e2.person_id = gp2.person_id
+                       WHERE gp1.source_id = ? AND gp2.display_name = ?""",
+                    [jid, owner_name],
+                ).fetchone()
+                shared_groups = shared[0] if shared and shared[0] else []
+        except duckdb.Error as e:
+            log.debug("shared_groups lookup failed: %s", e)
+        try:
+            if has_mentions:
+                rows = conn.execute(
+                    """SELECT ge.entity_type, ge.entity_value, epm.mention_count
+                       FROM edge_person_mentions_entity epm
+                       JOIN graph_entities ge ON epm.entity_id = ge.entity_id
+                       JOIN graph_persons gp ON epm.person_id = gp.person_id
+                       WHERE gp.source_id = ?
+                       ORDER BY epm.mention_count DESC LIMIT 5""",
+                    [jid],
+                ).fetchall()
+                entities = [(t, v, c) for t, v, c in rows]
+        except duckdb.Error as e:
+            log.debug("entities lookup failed: %s", e)
+        graph_info[jid] = (dm_volume, shared_groups, entities)
+        return graph_info[jid]
+
+    for r in results:
+        r["group_name"] = chat_label(r["chat_jid"])
+
+        row = contact(r["sender_jid"])
         if row:
             r["display_name"] = row[1] or row[0] or row[2]
             r["phone"] = _phone_from_jid(row[2])
@@ -305,48 +425,10 @@ def enrich_results(
         if not use_graph:
             continue
 
-        try:
-            dm = conn.execute(
-                """SELECT COALESCE(SUM(message_count), 0)
-                   FROM edge_person_messaged epm
-                   JOIN graph_persons gp ON (epm.sender_person_id = gp.person_id OR epm.receiver_person_id = gp.person_id)
-                   WHERE gp.source_id = ?""",
-                [r["sender_jid"]],
-            ).fetchone()
-            r["dm_volume"] = dm[0] if dm else 0
-        except Exception:
-            pass
-
-        try:
-            if owner_name:
-                shared = conn.execute(
-                    """SELECT LIST(DISTINCT gg.group_name)
-                       FROM edge_person_in_group e1
-                       JOIN edge_person_in_group e2 ON e1.group_jid = e2.group_jid
-                       JOIN graph_groups gg ON e1.group_jid = gg.group_jid
-                       JOIN graph_persons gp1 ON e1.person_id = gp1.person_id
-                       JOIN graph_persons gp2 ON e2.person_id = gp2.person_id
-                       WHERE gp1.source_id = ? AND gp2.display_name = ?""",
-                    [r["sender_jid"], owner_name],
-                ).fetchone()
-                r["shared_groups"] = shared[0] if shared and shared[0] else []
-        except Exception:
-            pass
-
-        try:
-            if table_exists(conn, "edge_person_mentions_entity"):
-                entities = conn.execute(
-                    """SELECT ge.entity_type, ge.entity_value, epm.mention_count
-                       FROM edge_person_mentions_entity epm
-                       JOIN graph_entities ge ON epm.entity_id = ge.entity_id
-                       JOIN graph_persons gp ON epm.person_id = gp.person_id
-                       WHERE gp.source_id = ?
-                       ORDER BY epm.mention_count DESC LIMIT 5""",
-                    [r["sender_jid"]],
-                ).fetchall()
-                r["entities"] = [(t, v, c) for t, v, c in entities]
-        except Exception:
-            pass
+        dm_volume, shared_groups, entities = person_graph_info(r["sender_jid"])
+        r["dm_volume"] = dm_volume
+        r["shared_groups"] = list(shared_groups)
+        r["entities"] = list(entities)
 
     return results
 

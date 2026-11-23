@@ -9,13 +9,20 @@ DIMS = 4
 class RecordingConn:
     """Pass-through connection that records the SQL a search function runs."""
 
-    def __init__(self, conn):
+    def __init__(self, conn, sql=None):
         self.conn = conn
-        self.sql: list[tuple[str, list | None]] = []
+        self.sql: list[tuple[str, list | None]] = [] if sql is None else sql
 
     def execute(self, sql, params=None):
         self.sql.append((sql, params))
         return self.conn.execute(sql, params) if params is not None else self.conn.execute(sql)
+
+    def cursor(self):
+        # semantic_search runs each query variant on its own cursor; record those too.
+        return RecordingConn(self.conn.cursor(), self.sql)
+
+    def close(self):
+        self.conn.close()
 
 
 def _db(tmp_path, rows):
@@ -111,3 +118,20 @@ def test_rrf_fuse_keeps_messages_that_share_an_id():
     b = {"id": "dup", "chat_jid": "chat-b@g.us"}
     fused = search.rrf_fuse([("bm25", [a, b]), ("vector", [b])])
     assert [(d["id"], d["chat_jid"]) for d in fused] == [("dup", "chat-b@g.us"), ("dup", "chat-a@g.us")]
+
+
+def test_parallel_variants_match_sequential(tmp_path):
+    conn = _db(tmp_path, ROWS)
+    create_hnsw_index(conn)
+    vectors = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.5, 0.5, 0.0, 0.0]]
+    together = search.semantic_search(conn, vectors, DIMS, top_k=4)
+    one_by_one = {}
+    for v in vectors:
+        for r in search.semantic_search(conn, [v], DIMS, top_k=4):
+            key = (r["id"], r["chat_jid"])
+            if key not in one_by_one or r["similarity"] > one_by_one[key]["similarity"]:
+                one_by_one[key] = r
+    expected = sorted(one_by_one.values(), key=lambda x: x["similarity"], reverse=True)[:4]
+    assert [(r["id"], r["chat_jid"], r["similarity"]) for r in together] == [
+        (r["id"], r["chat_jid"], r["similarity"]) for r in expected
+    ]
