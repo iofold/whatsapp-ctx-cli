@@ -11,6 +11,8 @@ Everything is contained in two files:
 ## Quickstart
 
 Install `wactx` immediately via pip or uv. No Go compiler or build steps are required.
+Prebuilt wheels bundle the sync binary for Linux x86_64/aarch64 (glibc 2.28+), macOS 12+
+(Intel and Apple Silicon), and Windows x64.
 
 ```bash
 pip install whatsapp-ctx-cli
