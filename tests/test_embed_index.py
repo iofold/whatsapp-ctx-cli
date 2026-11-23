@@ -2,6 +2,7 @@ import subprocess
 from types import SimpleNamespace
 
 import duckdb
+import pytest
 
 import wactx.embed as embed
 import wactx.sync as sync
@@ -103,3 +104,36 @@ async def test_run_pipeline_keeps_index_when_nothing_to_embed(tmp_path, monkeypa
     await embed.run_pipeline(cfg)
     conn = get_connection(cfg)
     assert _index_exists(conn)
+
+
+def test_sync_can_leave_the_index_for_wactx_index(tmp_path, monkeypatch):
+    cfg = _config(tmp_path)
+    _seed(cfg, embedded=3, pending=0)
+    monkeypatch.setattr(sync, "_require_binary", lambda _cfg: tmp_path / "whatsapp-sync")
+    monkeypatch.setattr(sync.subprocess, "run", lambda cmd, check: subprocess.CompletedProcess(cmd, 0))
+
+    sync.sync_whatsapp(cfg, restore_index=False)
+    conn = get_connection(cfg)
+    assert not _index_exists(conn)
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "flags, has_key, expect_restore",
+    [([], True, False), (["--no-post-process"], True, False), ([], False, True)],
+)
+def test_sync_cli_rebuilds_index_only_when_nothing_else_will(tmp_path, monkeypatch, flags, has_key, expect_restore):
+    from click.testing import CliRunner
+
+    from wactx import cli as cli_mod
+    from wactx import pipeline
+
+    calls = []
+    monkeypatch.setattr(sync, "sync_whatsapp", lambda cfg, **kw: calls.append(kw["restore_index"]))
+    monkeypatch.setattr(pipeline, "run_post_sync", lambda cfg: calls.append("post"))
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(f'db_path = "{tmp_path / "db.duckdb"}"\n[api]\nkey = "{"sk-test" if has_key else ""}"\n')
+    result = CliRunner().invoke(cli_mod.cli, ["--config-path", str(cfg_path), "sync", *flags])
+    assert result.exit_code == 0, result.output
+    assert calls[0] is expect_restore
+    assert ("post" in calls) is (has_key and "--no-post-process" not in flags)

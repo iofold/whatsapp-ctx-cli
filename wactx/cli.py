@@ -271,7 +271,7 @@ def config_cmd(ctx, key, value):
 @click.option(
     "--no-post-process",
     is_flag=True,
-    help="Skip indexing, enrichment, and graph after sync",
+    help="Skip indexing (incl. the vector index rebuild), enrichment, and graph; run `wactx index` later",
 )
 @click.pass_context
 def sync(ctx, full, live, no_post_process):
@@ -283,9 +283,14 @@ def sync(ctx, full, live, no_post_process):
     from wactx.sync import sync_whatsapp
 
     cfg = ctx.obj["config"]
-    sync_whatsapp(cfg, incremental=not full, live=live)
+    post_process = not no_post_process and bool(cfg.api.key)
+    # Post-processing rebuilds the vector index itself, and --no-post-process defers it
+    # to `wactx index`; only rebuild here when nothing else will.
+    sync_whatsapp(
+        cfg, incremental=not full, live=live, restore_index=not post_process and not no_post_process
+    )
 
-    if not no_post_process and cfg.api.key:
+    if post_process:
         from wactx.pipeline import run_post_sync
 
         run_post_sync(cfg)

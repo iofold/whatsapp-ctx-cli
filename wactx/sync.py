@@ -81,7 +81,12 @@ def _resolve_media_dir(config: Config) -> str:
     return str(config.db_path.parent / p)
 
 
-def sync_whatsapp(config: Config, incremental: bool = True, live: bool = False) -> None:
+def sync_whatsapp(
+    config: Config, incremental: bool = True, live: bool = False, restore_index: bool = True
+) -> None:
+    """Run the Go sync binary. The HNSW index is dropped while it writes (see
+    embed.drop_hnsw_index); pass restore_index=False when `wactx index` runs next, since
+    it recreates the index itself and the rebuild costs ~75 s on ~220k vectors."""
     binary = _require_binary(config)
 
     cmd = [
@@ -113,8 +118,10 @@ def sync_whatsapp(config: Config, incremental: bool = True, live: bool = False) 
     except KeyboardInterrupt:
         log.info("Sync interrupted")
     finally:
-        if index_suspended:
+        if index_suspended and restore_index:
             _restore_embedding_index(config)
+        elif index_suspended:
+            log.info("Vector index left for `wactx index` to rebuild")
 
 
 def _suspend_embedding_index(config: Config) -> bool:
