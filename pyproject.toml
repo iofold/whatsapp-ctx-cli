@@ -7,7 +7,8 @@ license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.0",
-    "duckdb>=1.0",
+    # duckdb 2.0 breaks BM25 search (binder error on the score alias) and HNSW index use.
+    "duckdb>=1.5,<2",
     "igraph>=0.11",
     "networkx>=3.0",
     "scipy>=1.12",
@@ -15,7 +16,6 @@ dependencies = [
     "pytz",
     "rich>=13.0",
     "spacy>=3.7",
-    "en-core-web-sm>=3.7",
 ]
 
 [tool.uv.sources]
@@ -29,6 +29,15 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
+# The spaCy model is not on PyPI, so it cannot be a published dependency (PyPI rejects
+# direct-URL requirements). Kept as a default group for local checkouts; wheel users
+# install it separately (see README). enrich falls back to regex + blank spaCy without it.
+ner = [
+    "en-core-web-sm>=3.7",
+]
+
+[tool.uv]
+default-groups = ["dev", "ner"]
 
 [tool.setuptools.packages.find]
 include = ["wactx*"]

@@ -22,6 +22,15 @@ uv tool install whatsapp-ctx-cli
 
 After installation, the `wactx` command is available in your PATH.
 
+`wactx enrich` uses spaCy's `en_core_web_sm` model for entity extraction. The model is not
+on PyPI, so it is not installed automatically; without it, enrich falls back to regex-only
+extraction. To install it:
+
+```bash
+python -m spacy download en_core_web_sm                       # pip installs
+uv tool install whatsapp-ctx-cli --with https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl   # uv tool installs
+```
+
 ```bash
 wactx init                    # interactive setup for provider and API key
 wactx sync                    # scan QR code on first run

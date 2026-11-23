@@ -219,6 +219,11 @@ def _normalize_entity(etype: str, value: str) -> tuple[str, str] | None:
 _NLP = None
 
 
+_SPACY_MODEL_URL = (
+    "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+)
+
+
 def _get_nlp():
     global _NLP
     if _NLP is not None:
@@ -228,7 +233,10 @@ def _get_nlp():
         _NLP = spacy.load("en_core_web_sm", enable=["ner"])
     except OSError:
         log.warning(
-            "SpaCy model not found. Install with: uv pip install en-core-web-sm@https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+            "spaCy model en_core_web_sm not found; using regex-only entity extraction. "
+            "Install it with `python -m spacy download en_core_web_sm` (pip) or "
+            "`uv tool install whatsapp-ctx-cli --with %s` (uv tool).",
+            _SPACY_MODEL_URL,
         )
         spacy = importlib.import_module("spacy")
         _NLP = spacy.blank("en")
