@@ -17,7 +17,7 @@ jobs:
         with:
           go-version-file: whatsapp-sync/go.mod
           cache-dependency-path: whatsapp-sync/go.sum
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.4.0
         with:
           python-version: "3.12"
       - name: Go vet + tests
