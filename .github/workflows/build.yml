@@ -30,17 +30,54 @@ jobs:
           uv sync --locked
           uv run pytest tests/ -q
 
-  build-go:
+  # Linux binaries are built inside PyPA manylinux_2_28 containers (glibc 2.28) so they run
+  # on any distro the wheel tag promises. Built on ubuntu-latest (26.04) they needed glibc 2.43.
+  build-go-linux:
     needs: test
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
-            goos: linux
             goarch: amd64
-          - os: ubuntu-latest
-            goos: linux
+            image: quay.io/pypa/manylinux_2_28_x86_64
+          - os: ubuntu-24.04-arm
             goarch: arm64
+            image: quay.io/pypa/manylinux_2_28_aarch64
+
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: whatsapp-sync/go.mod
+          cache-dependency-path: whatsapp-sync/go.sum
+
+      - name: Build Go binary
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          cd whatsapp-sync
+          go build -o "../wactx/bin/whatsapp-sync-linux-${{ matrix.goarch }}" .
+
+      - name: Check glibc floor (must stay <= 2.28 for the manylinux_2_28 tag)
+        run: |
+          BIN="wactx/bin/whatsapp-sync-linux-${{ matrix.goarch }}"
+          NEED=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+          echo "$BIN requires $NEED"
+          [ "$(printf '%s\nGLIBC_2.28\n' "$NEED" | sort -V | tail -1)" = "GLIBC_2.28" ]
+          "$BIN" analytics -db /tmp/smoke.duckdb > /dev/null
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-linux-${{ matrix.goarch }}
+          path: wactx/bin/whatsapp-sync-*
+
+  build-go:
+    needs: test
+    strategy:
+      matrix:
+        include:
           - os: macos-latest
             goos: darwin
             goarch: amd64
@@ -59,19 +96,15 @@ jobs:
           go-version-file: whatsapp-sync/go.mod
           cache-dependency-path: whatsapp-sync/go.sum
 
-      - name: Install cross-compilation deps (Linux arm64)
-        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-
       - name: Build Go binary
         shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "1"
+          # Without this the binary inherits the runner SDK's macOS version (26.0).
+          # 12.0 is Go 1.26's floor; DuckDB's static library targets 11.0.
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
         run: |
           cd whatsapp-sync
           BINARY_NAME="whatsapp-sync-${{ matrix.goos }}-${{ matrix.goarch }}"
@@ -81,27 +114,35 @@ jobs:
           go build -o "../wactx/bin/${BINARY_NAME}" .
           ls -lh "../wactx/bin/${BINARY_NAME}"
 
+      - name: Check macOS floor (must stay 12.0 for the macosx_12_0 tag)
+        if: matrix.goos == 'darwin'
+        run: |
+          BIN="wactx/bin/whatsapp-sync-darwin-${{ matrix.goarch }}"
+          MINOS=$(otool -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f && $1=="minos"{print $2; exit}')
+          echo "$BIN minos $MINOS"
+          [ "$MINOS" = "12.0" ]
+
       - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
           path: wactx/bin/whatsapp-sync-*
 
   build-wheels:
-    needs: build-go
+    needs: [build-go, build-go-linux]
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
-            platform: manylinux_2_17_x86_64
+            platform: manylinux_2_28_x86_64
             go_artifact: binary-linux-amd64
           - os: ubuntu-latest
-            platform: manylinux_2_17_aarch64
+            platform: manylinux_2_28_aarch64
             go_artifact: binary-linux-arm64
           - os: macos-latest
-            platform: macosx_11_0_x86_64
+            platform: macosx_12_0_x86_64
             go_artifact: binary-darwin-amd64
           - os: macos-latest
-            platform: macosx_11_0_arm64
+            platform: macosx_12_0_arm64
             go_artifact: binary-darwin-arm64
           - os: windows-latest
             platform: win_amd64
