@@ -57,6 +57,9 @@ jobs:
         env:
           CGO_ENABLED: "1"
         run: |
+          # The checkout is owned by the runner user, not the container's root; without this
+          # git refuses the repo and Go's VCS stamping fails ("error obtaining VCS status").
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           cd whatsapp-sync
           go build -o "../wactx/bin/whatsapp-sync-linux-${{ matrix.goarch }}" .
 
