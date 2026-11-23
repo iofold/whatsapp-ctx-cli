@@ -313,16 +313,37 @@ def _extract_spacy(
     return results
 
 
+# Messages already run through NER, keyed like messages (ids repeat across chats). Before
+# this, "unprocessed" meant "has no extracted entity", so every message that yielded none
+# (85,657 of 143,369 on the live DB) went through spaCy again on every run.
+SCANNED_TABLE = "entity_scanned_messages"
+
+
+def _ensure_scanned_table(conn: duckdb.DuckDBPyConnection) -> None:
+    if table_exists(conn, SCANNED_TABLE):
+        return
+    conn.execute(f"CREATE TABLE {SCANNED_TABLE} (message_id VARCHAR NOT NULL, chat_jid VARCHAR NOT NULL)")
+    # Messages with entities were certainly scanned; the rest get one more pass.
+    conn.execute(
+        f"INSERT INTO {SCANNED_TABLE} SELECT DISTINCT message_id, chat_jid FROM extracted_entities"
+    )
+
+
 async def extract_entities(
     conn: duckdb.DuckDBPyConnection, config: Config, process_all: bool = False
 ) -> int:
     ensure_entity_table(conn)
+    _ensure_scanned_table(conn)
 
     where_skip = ""
-    if not process_all:
-        where_skip = (
-            " AND m.id NOT IN (SELECT DISTINCT message_id FROM extracted_entities)"
-        )
+    if process_all:
+        conn.execute(f"DELETE FROM {SCANNED_TABLE}")
+    else:
+        where_skip = f"""
+          AND NOT EXISTS (
+            SELECT 1 FROM {SCANNED_TABLE} s
+            WHERE s.message_id = m.id AND s.chat_jid = m.chat_jid
+          )"""
 
     rows = conn.execute(f"""
         SELECT m.id, m.chat_jid, m.push_name, m.text_content
@@ -372,15 +393,77 @@ async def extract_entities(
             "INSERT OR IGNORE INTO extracted_entities (message_id, chat_jid, entity_type, entity_value) VALUES (?, ?, ?, ?)",
             flat[i : i + 1000],
         )
+    conn.execute(
+        f"INSERT INTO {SCANNED_TABLE} SELECT UNNEST(?::VARCHAR[]), UNNEST(?::VARCHAR[])",
+        [msg_ids, chat_jids],
+    )
 
-    deduped = dedup_entities(conn)
-    log.info("Dedup pass merged %d entity values", deduped)
+    if flat or process_all:
+        deduped = dedup_entities(conn)
+        log.info("Dedup pass merged %d entity values", deduped)
+    else:
+        log.info("No new entity mentions; dedup pass skipped")
     return len(flat)
 
 
-def dedup_entities(conn: duckdb.DuckDBPyConnection) -> int:
+def compute_entity_merges(rows: list[tuple[str, str, int]]) -> dict[str, str]:
+    """Map entity values to the canonical value they should merge into.
+
+    rows: (entity_type, entity_value, count). Same rules as before (case-insensitive
+    equality, substring containment, SequenceMatcher ratio > 0.85), but the ratio is only
+    computed when it can exceed 0.85: the length bound 2*min/(len_a+len_b) and
+    quick_ratio() are upper bounds of ratio(), and each canonical keeps one matcher with
+    its string preprocessed. Same merges; ~128 s -> a few seconds on ~120k mentions.
+    """
     from difflib import SequenceMatcher
 
+    by_type: dict[str, list[tuple[str, int]]] = {}
+    for etype, val, count in rows:
+        by_type.setdefault(etype, []).append((val, count))
+
+    merges: dict[str, str] = {}
+    for _etype, values in by_type.items():
+        values.sort(key=lambda x: -x[1])
+        # (canonical, count, lowercased, matcher with seq2 = lowercased)
+        canonicals: list[tuple[str, int, str, SequenceMatcher]] = []
+
+        for val, count in values:
+            v_lower = val.lower()
+            lv = len(v_lower)
+            merged = False
+
+            for canon, canon_count, c_lower, matcher in canonicals:
+                if v_lower == c_lower:
+                    merges[val] = canon
+                    merged = True
+                    break
+
+                lc = len(c_lower)
+                if lv > 3 and lc > 3:
+                    if v_lower in c_lower or c_lower in v_lower:
+                        shorter = val if len(val) < len(canon) else canon
+                        longer = canon if shorter == val else val
+                        target = longer if count < canon_count else shorter
+                        if target != val:
+                            merges[val] = target
+                        merged = True
+                        break
+
+                if lv > 5 and lc > 5 and 2.0 * min(lv, lc) / (lv + lc) > 0.85:
+                    matcher.set_seq1(v_lower)
+                    if matcher.quick_ratio() > 0.85 and matcher.ratio() > 0.85:
+                        merges[val] = canon
+                        merged = True
+                        break
+
+            if not merged:
+                matcher = SequenceMatcher(None, autojunk=True)
+                matcher.set_seq2(v_lower)
+                canonicals.append((val, count, v_lower, matcher))
+    return merges
+
+
+def dedup_entities(conn: duckdb.DuckDBPyConnection) -> int:
     if not table_exists(conn, "extracted_entities"):
         return 0
 
@@ -393,75 +476,38 @@ def dedup_entities(conn: duckdb.DuckDBPyConnection) -> int:
         ORDER BY c DESC
     """).fetchall()
 
-    by_type: dict[str, list[tuple[str, int]]] = {}
-    for etype, val, count in rows:
-        by_type.setdefault(etype, []).append((val, count))
-
-    merges: dict[str, str] = {}
-
-    for etype, entities in by_type.items():
-        entities.sort(key=lambda x: -x[1])
-        canonicals: list[tuple[str, int]] = []
-
-        for val, count in entities:
-            v_lower = val.lower()
-            merged = False
-
-            for canon, canon_count in canonicals:
-                c_lower = canon.lower()
-
-                if v_lower == c_lower:
-                    merges[val] = canon
-                    merged = True
-                    break
-
-                if len(v_lower) > 3 and len(c_lower) > 3:
-                    if v_lower in c_lower or c_lower in v_lower:
-                        shorter = val if len(val) < len(canon) else canon
-                        longer = canon if shorter == val else val
-                        target = longer if count < canon_count else shorter
-                        if target != val:
-                            merges[val] = target
-                        merged = True
-                        break
-
-                if len(v_lower) > 5 and len(c_lower) > 5:
-                    ratio = SequenceMatcher(None, v_lower, c_lower).ratio()
-                    if ratio > 0.85:
-                        merges[val] = canon
-                        merged = True
-                        break
-
-            if not merged:
-                canonicals.append((val, count))
-
+    merges = compute_entity_merges(rows)
     if not merges:
         return 0
 
-    updated = 0
-    for old_val, new_val in merges.items():
-        try:
-            conn.execute(
-                "UPDATE extracted_entities SET entity_value = ? WHERE entity_value = ?",
-                [new_val, old_val],
-            )
-            updated += 1
-        except Exception:
-            pass
-
+    # Was one UPDATE per merge, which hit the (message_id, entity_type, entity_value) key
+    # whenever a message already mentioned the canonical value: 56 of 65 merges failed
+    # silently on the live DB and were re-found every run. Insert the canonical value
+    # where it is missing, then drop the old one, in one transaction.
+    olds = list(merges)
+    news = [merges[o] for o in olds]
+    conn.execute("BEGIN TRANSACTION")
     try:
-        conn.execute("""
-            DELETE FROM extracted_entities
-            WHERE rowid NOT IN (
-                SELECT MIN(rowid)
-                FROM extracted_entities
-                GROUP BY message_id, entity_type, entity_value
-            )
-        """)
-    except Exception:
-        pass
-
-    return updated
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO extracted_entities (message_id, chat_jid, entity_type, entity_value)
+            SELECT DISTINCT e.message_id, e.chat_jid, e.entity_type, m.new_value
+            FROM extracted_entities e
+            JOIN (SELECT UNNEST(?::VARCHAR[]) AS old_value, UNNEST(?::VARCHAR[]) AS new_value) m
+              ON e.entity_value = m.old_value
+            """,
+            [olds, news],
+        )
+        conn.execute(
+            "DELETE FROM extracted_entities WHERE entity_value IN (SELECT UNNEST(?::VARCHAR[]))",
+            [olds],
+        )
+        conn.execute("COMMIT")
+    except duckdb.Error as e:
+        conn.execute("ROLLBACK")
+        log.warning("Entity dedup failed; values left unmerged: %s", e)
+        return 0
+    return len(merges)
 
 
 def get_entity_stats(conn: duckdb.DuckDBPyConnection) -> dict:
