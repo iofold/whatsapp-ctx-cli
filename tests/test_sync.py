@@ -60,3 +60,10 @@ def test_find_binary_prefers_bundled_binary_over_cwd(tmp_path, monkeypatch):
             bundled.chmod(0o755)
         elif bundled.exists():
             bundled.unlink()
+
+
+def test_find_binary_warns_when_configured_path_is_missing(caplog, tmp_path):
+    cfg = Config(sync=SyncConfig(binary_path=str(tmp_path / "gone" / "whatsapp-sync")))
+    with caplog.at_level("WARNING", logger="wactx.sync"):
+        find_binary(cfg)
+    assert "missing or not executable" in caplog.text

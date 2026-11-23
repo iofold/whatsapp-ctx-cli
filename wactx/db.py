@@ -10,6 +10,8 @@ from wactx.config import Config
 
 SCHEMA_VERSION = 1
 
+log = logging.getLogger("wactx.db")
+
 
 EXTENSIONS = ["vss", "duckpgq"]
 
@@ -33,13 +35,39 @@ EXTENSION_INSTALL = {
 }
 
 
+_warned_extensions: set[str] = set()
+
+
+def load_extension(conn: duckdb.DuckDBPyConnection, ext: str) -> bool:
+    """LOAD a DuckDB extension, installing it first only if it is not already present.
+
+    Failures used to be swallowed silently, which hid real breakage (no vss means no HNSW
+    index; no fts means keyword search returns nothing). Warn once per extension instead.
+    """
+    try:
+        conn.execute(f"LOAD {ext}")
+        return True
+    except duckdb.Error:
+        pass
+    try:
+        conn.execute(EXTENSION_INSTALL.get(ext, f"INSTALL {ext}"))
+        conn.execute(f"LOAD {ext}")
+        return True
+    except duckdb.Error as exc:
+        if ext not in _warned_extensions:
+            _warned_extensions.add(ext)
+            log.warning(
+                "DuckDB extension %r unavailable (DuckDB %s): %s",
+                ext,
+                duckdb.__version__,
+                str(exc).splitlines()[0],
+            )
+        return False
+
+
 def _load_extensions(conn: duckdb.DuckDBPyConnection) -> None:
     for ext in EXTENSIONS:
-        try:
-            conn.execute(EXTENSION_INSTALL.get(ext, f"INSTALL {ext}"))
-            conn.execute(f"LOAD {ext}")
-        except Exception:
-            pass
+        load_extension(conn, ext)
 
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
@@ -140,12 +168,7 @@ def ensure_fts_index(conn: duckdb.DuckDBPyConnection) -> None:
     2026-09-28), so an index keyed on `messages.id` made every match_bm25 call fail. The
     index is built over a side table keyed by id|chat_jid instead.
     """
-    try:
-        conn.execute("INSTALL fts")
-        conn.execute("LOAD fts")
-    except Exception:
-        pass
-    log = logging.getLogger("wactx.db")
+    load_extension(conn, "fts")
     try:
         eligible = conn.execute(
             "SELECT count(*) FROM messages WHERE text_content IS NOT NULL AND trim(text_content) <> ''"

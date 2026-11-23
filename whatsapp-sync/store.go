@@ -88,10 +88,22 @@ func NewDuckStore(path string) (*DuckStore, error) {
 	}
 
 	// Load extensions that wactx may have used on this DB (HNSW indexes, property graphs).
-	// Errors ignored — extensions may not be available in all environments.
-	for _, ext := range []string{"vss", "duckpgq"} {
-		db.Exec("INSTALL " + ext)
-		db.Exec("LOAD " + ext)
+	// Not fatal (they may be unavailable offline or for a new DuckDB release), but say so:
+	// a DB holding an HNSW index cannot be written without vss loaded.
+	for _, ext := range []struct{ name, install string }{
+		{"vss", "INSTALL vss"},
+		{"duckpgq", "INSTALL duckpgq FROM community"},
+	} {
+		if _, err := db.Exec("LOAD " + ext.name); err == nil {
+			continue
+		}
+		if _, err := db.Exec(ext.install); err != nil {
+			log.Printf("store: warning: install DuckDB extension %s: %v", ext.name, err)
+			continue
+		}
+		if _, err := db.Exec("LOAD " + ext.name); err != nil {
+			log.Printf("store: warning: load DuckDB extension %s: %v", ext.name, err)
+		}
 	}
 
 	if _, err := db.Exec(schemaSQL); err != nil {

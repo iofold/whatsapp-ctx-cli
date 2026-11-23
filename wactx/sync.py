@@ -35,6 +35,11 @@ def find_binary(config: Config) -> Path | None:
         p = Path(config.sync.binary_path).expanduser()
         if p.is_file() and os.access(p, os.X_OK):
             return p
+        log.warning(
+            "sync.binary_path %s is missing or not executable; using the bundled binary. "
+            "Clear it with: wactx config sync.binary_path ''",
+            p,
+        )
 
     candidates = [
         _PACKAGE_BIN / "whatsapp-sync",
