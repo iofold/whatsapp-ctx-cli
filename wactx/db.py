@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import duckdb
+
+if TYPE_CHECKING:
+    import numpy as np
 
 from wactx.config import Config
 
@@ -203,6 +208,24 @@ def _schema_has_table(conn: duckdb.DuckDBPyConnection, schema: str, table: str) 
         [schema, table],
     ).fetchone()
     return bool(row and row[0])
+
+
+@contextmanager
+def bulk_rows(conn: duckdb.DuckDBPyConnection, name: str, **columns: Sequence[Any] | np.ndarray) -> Iterator[str]:
+    """Expose Python columns to SQL as a view called `name` for the duration of the block.
+
+    Binding big lists as ?::VARCHAR[] parameters costs ~0.1 ms per element in DuckDB 1.5
+    (12 s per 120k-string column); scanning a registered dict of numpy arrays is ~50x
+    faster. Lists become object arrays (strings); pass a typed array for numbers. An empty
+    object column is typed INTEGER, so skip the statement when there are no rows.
+    """
+    import numpy as np
+
+    conn.register(name, {k: v if isinstance(v, np.ndarray) else np.array(v, dtype=object) for k, v in columns.items()})
+    try:
+        yield name
+    finally:
+        conn.unregister(name)
 
 
 def table_exists(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import duckdb
 
-from wactx.db import table_exists
+from wactx.db import bulk_rows, table_exists
 
 if TYPE_CHECKING:
     import numpy as np
@@ -520,15 +520,18 @@ def store_communities(
         conn.execute("UPDATE graph_persons SET community_id = -1")
 
     # One statement instead of one UPDATE per person (~9.7k statements, 25 s).
+    import numpy as np
+
     jids = list(communities)
-    conn.execute(
-        """
-        UPDATE graph_persons SET community_id = c.community_id
-        FROM (SELECT UNNEST(?::VARCHAR[]) AS source_id, UNNEST(?::INTEGER[]) AS community_id) c
-        WHERE graph_persons.source_id = c.source_id
-        """,
-        [jids, [int(communities[j]) for j in jids]],
-    )
+    ids = np.fromiter((communities[j] for j in jids), dtype=np.int32, count=len(jids))
+    with bulk_rows(conn, "_communities", source_id=jids, community_id=ids):
+        conn.execute(
+            """
+            UPDATE graph_persons SET community_id = c.community_id
+            FROM _communities c
+            WHERE graph_persons.source_id = c.source_id
+            """
+        )
 
     summaries: dict[int, dict] = {}
     try:

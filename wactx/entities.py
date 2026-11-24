@@ -8,7 +8,7 @@ import time
 import duckdb
 
 from wactx.config import Config
-from wactx.db import table_exists
+from wactx.db import bulk_rows, table_exists
 
 log = logging.getLogger("wactx.entities")
 
@@ -336,9 +336,7 @@ async def extract_entities(
     _ensure_scanned_table(conn)
 
     where_skip = ""
-    if process_all:
-        conn.execute(f"DELETE FROM {SCANNED_TABLE}")
-    else:
+    if not process_all:
         where_skip = f"""
           AND NOT EXISTS (
             SELECT 1 FROM {SCANNED_TABLE} s
@@ -388,19 +386,40 @@ async def extract_entities(
     elapsed = time.time() - t0
     log.info("Extracted %d entity mentions in %.1fs", len(flat), elapsed)
 
-    for i in range(0, len(flat), 1000):
-        conn.executemany(
-            "INSERT OR IGNORE INTO extracted_entities (message_id, chat_jid, entity_type, entity_value) VALUES (?, ?, ?, ?)",
-            flat[i : i + 1000],
-        )
-    conn.execute(
-        f"INSERT INTO {SCANNED_TABLE} SELECT UNNEST(?::VARCHAR[]), UNNEST(?::VARCHAR[])",
-        [msg_ids, chat_jids],
-    )
+    # --all rebuilds: stored mentions carry earlier dedup merges, so re-scanning on top of
+    # them (what --all used to do) could not undo a bad merge. One transaction, so a
+    # failure leaves the old entities in place. One bulk INSERT; executemany took >10 min
+    # for 120k mentions (and list parameters ~40 s).
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        if process_all:
+            conn.execute("DELETE FROM extracted_entities")
+            conn.execute(f"DELETE FROM {SCANNED_TABLE}")
+        if flat:
+            mid, cjid, etype, evalue = (list(c) for c in zip(*flat, strict=True))
+            with bulk_rows(conn, "_new_mentions", message_id=mid, chat_jid=cjid, entity_type=etype, entity_value=evalue):
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO extracted_entities (message_id, chat_jid, entity_type, entity_value)
+                    SELECT DISTINCT message_id, chat_jid, entity_type, entity_value FROM _new_mentions
+                    """
+                )
+        with bulk_rows(conn, "_scanned", message_id=msg_ids, chat_jid=chat_jids):
+            conn.execute(f"INSERT INTO {SCANNED_TABLE} SELECT message_id, chat_jid FROM _scanned")
+        conn.execute("COMMIT")
+    except duckdb.Error:
+        conn.execute("ROLLBACK")
+        raise
 
     if flat or process_all:
-        deduped = dedup_entities(conn)
-        log.info("Dedup pass merged %d entity values", deduped)
+        # A merge changes counts, so a few more values qualify on the next pass (live
+        # rebuild: 1152, then 11, then 0). Daily runs take one pass and pick up the rest
+        # the next night; a rebuild repeats until nothing changes.
+        for _ in range(5 if process_all else 1):
+            deduped = dedup_entities(conn)
+            log.info("Dedup pass merged %d entity values", deduped)
+            if not deduped:
+                break
     else:
         log.info("No new entity mentions; dedup pass skipped")
     return len(flat)
@@ -493,25 +512,22 @@ def dedup_entities(conn: duckdb.DuckDBPyConnection) -> int:
     news = list(merges.values())
     conn.execute("BEGIN TRANSACTION")
     try:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO extracted_entities (message_id, chat_jid, entity_type, entity_value)
-            SELECT DISTINCT e.message_id, e.chat_jid, e.entity_type, m.new_value
-            FROM extracted_entities e
-            JOIN (SELECT UNNEST(?::VARCHAR[]) AS entity_type, UNNEST(?::VARCHAR[]) AS old_value,
-                         UNNEST(?::VARCHAR[]) AS new_value) m
-              ON e.entity_type = m.entity_type AND e.entity_value = m.old_value
-            """,
-            [types, olds, news],
-        )
-        conn.execute(
-            """
-            DELETE FROM extracted_entities e
-            USING (SELECT UNNEST(?::VARCHAR[]) AS entity_type, UNNEST(?::VARCHAR[]) AS old_value) m
-            WHERE e.entity_type = m.entity_type AND e.entity_value = m.old_value
-            """,
-            [types, olds],
-        )
+        with bulk_rows(conn, "_merges", entity_type=types, old_value=olds, new_value=news):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO extracted_entities (message_id, chat_jid, entity_type, entity_value)
+                SELECT DISTINCT e.message_id, e.chat_jid, e.entity_type, m.new_value
+                FROM extracted_entities e
+                JOIN _merges m ON e.entity_type = m.entity_type AND e.entity_value = m.old_value
+                """
+            )
+            conn.execute(
+                """
+                DELETE FROM extracted_entities e
+                USING _merges m
+                WHERE e.entity_type = m.entity_type AND e.entity_value = m.old_value
+                """
+            )
         conn.execute("COMMIT")
     except duckdb.Error as e:
         conn.execute("ROLLBACK")

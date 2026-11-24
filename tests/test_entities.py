@@ -119,3 +119,27 @@ def test_dedup_leaves_the_same_value_in_another_type_alone():
     got = conn.execute("SELECT message_id, entity_type, entity_value FROM extracted_entities ORDER BY 1").fetchall()
     assert got == [("m1", "person", "Pragati Rao"), ("m2", "person", "Pragati Rao"), ("m3", "person", "Pragati Rao"),
                    ("m4", "person", "Pragati Rao"), ("m5", "org", "pragati rao"), ("m6", "org", "pragati rao")]
+
+
+async def test_reprocess_all_rebuilds_instead_of_adding_to_old_mentions(monkeypatch):
+    import duckdb
+
+    from wactx.config import Config
+
+    conn = duckdb.connect()
+    conn.execute("CREATE TABLE messages (id VARCHAR, chat_jid VARCHAR, push_name VARCHAR, text_content VARCHAR, is_group BOOLEAN, timestamp TIMESTAMP)")
+    conn.executemany(
+        "INSERT INTO messages VALUES (?, ?, 'x', ?, true, now())",
+        [("a", "g1", "met Acme today"), ("b", "g1", "nothing here")],
+    )
+    entities.ensure_entity_table(conn)
+    # A leftover from an earlier (bad) merge: --all used to keep it and only add rows.
+    conn.execute("INSERT INTO extracted_entities VALUES ('a', 'g1', 'org', 'Wrong Merge')")
+    found = {"met Acme today": [("org", "Acme"), ("org", "Acme")]}  # same mention twice in one batch
+    monkeypatch.setattr(entities, "_extract_spacy", lambda texts, senders: [found.get(t, []) for t in texts])
+
+    await entities.extract_entities(conn, Config(), process_all=True)
+    assert conn.execute("SELECT message_id, entity_type, entity_value FROM extracted_entities").fetchall() == [
+        ("a", "org", "Acme")
+    ]
+    assert conn.execute(f"SELECT count(*) FROM {entities.SCANNED_TABLE}").fetchone()[0] == 2
