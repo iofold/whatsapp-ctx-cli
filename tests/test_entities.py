@@ -24,7 +24,7 @@ def _naive_merges(rows):
     for etype, val, count in rows:
         by_type.setdefault(etype, []).append((val, count))
     merges = {}
-    for values in by_type.values():
+    for etype, values in by_type.items():
         values.sort(key=lambda x: -x[1])
         canonicals = []
         for val, count in values:
@@ -32,18 +32,18 @@ def _naive_merges(rows):
             for canon, canon_count in canonicals:
                 c_lower = canon.lower()
                 if v_lower == c_lower:
-                    merges[val], merged = canon, True
+                    merges[etype, val], merged = canon, True
                     break
                 if len(v_lower) > 3 and len(c_lower) > 3 and (v_lower in c_lower or c_lower in v_lower):
                     shorter = val if len(val) < len(canon) else canon
                     longer = canon if shorter == val else val
                     target = longer if count < canon_count else shorter
                     if target != val:
-                        merges[val] = target
+                        merges[etype, val] = target
                     merged = True
                     break
                 if len(v_lower) > 5 and len(c_lower) > 5 and SequenceMatcher(None, v_lower, c_lower).ratio() > 0.85:
-                    merges[val], merged = canon, True
+                    merges[etype, val], merged = canon, True
                     break
             if not merged:
                 canonicals.append((val, count))
@@ -102,3 +102,20 @@ async def test_messages_without_entities_are_not_rescanned(monkeypatch):
     conn.execute("INSERT INTO messages VALUES ('c', 'g1', 'x', 'new one', true, now())")
     await entities.extract_entities(conn, cfg)
     assert seen == [3, 1]  # all three once (both 'a's), then only the new message
+
+
+def test_dedup_leaves_the_same_value_in_another_type_alone():
+    # "Pragati" is a person and an org on the live DB. Merging the person spelling must not
+    # rename or delete the org rows (merges used to be keyed by value only).
+    import duckdb
+
+    conn = duckdb.connect()
+    entities.ensure_entity_table(conn)
+    rows = [("m1", "c1", "person", "Pragati Rao"), ("m2", "c1", "person", "Pragati Rao"),
+            ("m3", "c1", "person", "pragati rao"), ("m4", "c1", "person", "pragati rao"),
+            ("m5", "c1", "org", "pragati rao"), ("m6", "c1", "org", "pragati rao")]
+    conn.executemany("INSERT INTO extracted_entities VALUES (?, ?, ?, ?)", rows)
+    assert entities.dedup_entities(conn) == 1
+    got = conn.execute("SELECT message_id, entity_type, entity_value FROM extracted_entities ORDER BY 1").fetchall()
+    assert got == [("m1", "person", "Pragati Rao"), ("m2", "person", "Pragati Rao"), ("m3", "person", "Pragati Rao"),
+                   ("m4", "person", "Pragati Rao"), ("m5", "org", "pragati rao"), ("m6", "org", "pragati rao")]

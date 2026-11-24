@@ -406,10 +406,12 @@ async def extract_entities(
     return len(flat)
 
 
-def compute_entity_merges(rows: list[tuple[str, str, int]]) -> dict[str, str]:
-    """Map entity values to the canonical value they should merge into.
+def compute_entity_merges(rows: list[tuple[str, str, int]]) -> dict[tuple[str, str], str]:
+    """Map (entity_type, entity_value) to the canonical value it should merge into.
 
-    rows: (entity_type, entity_value, count). Same rules as before (case-insensitive
+    rows: (entity_type, entity_value, count), most frequent first; ties keep input order.
+    Keyed by type because one value can be an org and a person (457 such values on the
+    live DB); merging by value alone renamed or deleted it in the other type too. Same rules as before (case-insensitive
     equality, substring containment, SequenceMatcher ratio > 0.85), but the ratio is only
     computed when it can exceed 0.85: the length bound 2*min/(len_a+len_b) and
     quick_ratio() are upper bounds of ratio(), and each canonical keeps one matcher with
@@ -421,8 +423,8 @@ def compute_entity_merges(rows: list[tuple[str, str, int]]) -> dict[str, str]:
     for etype, val, count in rows:
         by_type.setdefault(etype, []).append((val, count))
 
-    merges: dict[str, str] = {}
-    for _etype, values in by_type.items():
+    merges: dict[tuple[str, str], str] = {}
+    for etype, values in by_type.items():
         values.sort(key=lambda x: -x[1])
         # (canonical, count, lowercased, matcher with seq2 = lowercased)
         canonicals: list[tuple[str, int, str, SequenceMatcher]] = []
@@ -434,7 +436,7 @@ def compute_entity_merges(rows: list[tuple[str, str, int]]) -> dict[str, str]:
 
             for canon, canon_count, c_lower, matcher in canonicals:
                 if v_lower == c_lower:
-                    merges[val] = canon
+                    merges[etype, val] = canon
                     merged = True
                     break
 
@@ -445,14 +447,14 @@ def compute_entity_merges(rows: list[tuple[str, str, int]]) -> dict[str, str]:
                         longer = canon if shorter == val else val
                         target = longer if count < canon_count else shorter
                         if target != val:
-                            merges[val] = target
+                            merges[etype, val] = target
                         merged = True
                         break
 
                 if lv > 5 and lc > 5 and 2.0 * min(lv, lc) / (lv + lc) > 0.85:
                     matcher.set_seq1(v_lower)
                     if matcher.quick_ratio() > 0.85 and matcher.ratio() > 0.85:
-                        merges[val] = canon
+                        merges[etype, val] = canon
                         merged = True
                         break
 
@@ -473,9 +475,11 @@ def dedup_entities(conn: duckdb.DuckDBPyConnection) -> int:
         WHERE entity_type != 'url'
         GROUP BY entity_type, entity_value
         HAVING COUNT(*) >= 2
-        ORDER BY c DESC
+        ORDER BY c DESC, entity_type, entity_value
     """).fetchall()
 
+    # The tie-breakers matter: canonicals are picked in row order, so ties in arbitrary
+    # order gave different merges run to run.
     merges = compute_entity_merges(rows)
     if not merges:
         return 0
@@ -484,8 +488,9 @@ def dedup_entities(conn: duckdb.DuckDBPyConnection) -> int:
     # whenever a message already mentioned the canonical value: 56 of 65 merges failed
     # silently on the live DB and were re-found every run. Insert the canonical value
     # where it is missing, then drop the old one, in one transaction.
-    olds = list(merges)
-    news = [merges[o] for o in olds]
+    types = [t for t, _ in merges]
+    olds = [v for _, v in merges]
+    news = list(merges.values())
     conn.execute("BEGIN TRANSACTION")
     try:
         conn.execute(
@@ -493,14 +498,19 @@ def dedup_entities(conn: duckdb.DuckDBPyConnection) -> int:
             INSERT OR IGNORE INTO extracted_entities (message_id, chat_jid, entity_type, entity_value)
             SELECT DISTINCT e.message_id, e.chat_jid, e.entity_type, m.new_value
             FROM extracted_entities e
-            JOIN (SELECT UNNEST(?::VARCHAR[]) AS old_value, UNNEST(?::VARCHAR[]) AS new_value) m
-              ON e.entity_value = m.old_value
+            JOIN (SELECT UNNEST(?::VARCHAR[]) AS entity_type, UNNEST(?::VARCHAR[]) AS old_value,
+                         UNNEST(?::VARCHAR[]) AS new_value) m
+              ON e.entity_type = m.entity_type AND e.entity_value = m.old_value
             """,
-            [olds, news],
+            [types, olds, news],
         )
         conn.execute(
-            "DELETE FROM extracted_entities WHERE entity_value IN (SELECT UNNEST(?::VARCHAR[]))",
-            [olds],
+            """
+            DELETE FROM extracted_entities e
+            USING (SELECT UNNEST(?::VARCHAR[]) AS entity_type, UNNEST(?::VARCHAR[]) AS old_value) m
+            WHERE e.entity_type = m.entity_type AND e.entity_value = m.old_value
+            """,
+            [types, olds],
         )
         conn.execute("COMMIT")
     except duckdb.Error as e:
